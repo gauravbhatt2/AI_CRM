@@ -1,7 +1,7 @@
 """
 Contextual CRM mapping: derive Account, Contact, and Deal from transcript + extraction.
 
-Primary path: Gemini entity resolution against recent CRM rows. Fallback: rule-based heuristics.
+Primary path: Groq entity resolution against recent CRM rows. Fallback: rule-based heuristics.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.models import Account, Contact, Deal
-from app.services.gemini_mapping import llm_suggest_crm_links
+from app.services.groq_mapping import llm_suggest_crm_links
 
 logger = logging.getLogger(__name__)
 
@@ -115,10 +115,17 @@ def _get_or_create_account(db: Session, name: str) -> Account:
     return row
 
 
-def _get_or_create_contact(db: Session, *, account_id: int, name: str) -> Contact:
+def _get_or_create_contact(
+    db: Session,
+    *,
+    account_id: int,
+    name: str,
+    email: str = "",
+) -> Contact:
     key = name.strip()
     if not key:
         key = "Unknown Contact"
+    em = (email or "").strip()[:512]
     existing = db.scalars(
         select(Contact).where(
             Contact.account_id == account_id,
@@ -126,15 +133,44 @@ def _get_or_create_contact(db: Session, *, account_id: int, name: str) -> Contac
         )
     ).first()
     if existing:
+        if em and not (existing.email or "").strip():
+            existing.email = em
+            db.flush()
         return existing
-    row = Contact(account_id=account_id, name=key)
+    row = Contact(account_id=account_id, name=key, email=em)
     db.add(row)
     db.flush()
     return row
 
 
-def _create_deal(db: Session, *, account_id: int, value: str | None) -> Deal:
-    row = Deal(account_id=account_id, value=value if value else None)
+def _stage_from_intent(intent_raw: str) -> str:
+    """Map extracted intent text to a simple opportunity stage (FRD / DRD)."""
+    t = (intent_raw or "").lower()
+    if any(x in t for x in ("close", "won", "signed", "purchase order")):
+        return "Closed Won"
+    if any(x in t for x in ("negotiat", "proposal", "contract", "pilot")):
+        return "Negotiation"
+    if any(x in t for x in ("high", "ready to buy", "budget approved")):
+        return "Proposal"
+    if any(x in t for x in ("low", "explor", "maybe", "just looking")):
+        return "Qualification"
+    return "Open"
+
+
+def _create_deal(
+    db: Session,
+    *,
+    account_id: int,
+    value: str | None,
+    intent_hint: str = "",
+) -> Deal:
+    ih = (intent_hint or "").strip()
+    row = Deal(
+        account_id=account_id,
+        value=value if value else None,
+        stage=_stage_from_intent(ih),
+        intent_snapshot=ih[:512],
+    )
     db.add(row)
     db.flush()
     return row
@@ -149,11 +185,22 @@ def _budget_from_extracted(extracted_data: dict[str, Any]) -> str:
     return str(b).strip()
 
 
+def _contact_email_from_metadata(meta: dict[str, Any] | None) -> str:
+    if not meta:
+        return ""
+    for k in ("contact_email", "email", "from_email", "participant_email"):
+        v = meta.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:512]
+    return ""
+
+
 def _apply_llm_suggestion(
     db_session: Session,
     suggestion: dict[str, Any],
     transcript: str,
     extracted_data: dict[str, Any],
+    source_metadata: dict[str, Any] | None,
 ) -> dict[str, int | None] | None:
     ma = suggestion.get("match_account_id")
     mc = suggestion.get("match_contact_id")
@@ -173,11 +220,13 @@ def _apply_llm_suggestion(
         c = db_session.get(Contact, mc)
         if c and c.account_id == account.id:
             contact = c
+    em = _contact_email_from_metadata(source_metadata)
     if contact is None and rp:
         contact = _get_or_create_contact(
             db_session,
             account_id=account.id,
             name=rp,
+            email=em,
         )
     if contact is None:
         person = _extract_contact_from_transcript(transcript, account.name)
@@ -186,13 +235,16 @@ def _apply_llm_suggestion(
                 db_session,
                 account_id=account.id,
                 name=person,
+                email=em,
             )
 
     budget_hint = _budget_from_extracted(extracted_data)
+    intent_hint = str(extracted_data.get("intent") or "").strip()
     deal = _create_deal(
         db_session,
         account_id=account.id,
         value=budget_hint or None,
+        intent_hint=intent_hint,
     )
 
     return {
@@ -206,6 +258,8 @@ def map_entities_to_crm_rules(
     transcript: str,
     extracted_data: dict[str, Any],
     db_session: Session,
+    *,
+    source_metadata: dict[str, Any] | None = None,
 ) -> dict[str, int | None]:
     """
     Map transcript + extracted fields to Account, Contact, and Deal rows using heuristics only.
@@ -222,19 +276,23 @@ def map_entities_to_crm_rules(
         account = _get_or_create_account(db_session, company)
 
         contact: Contact | None = None
+        em = _contact_email_from_metadata(source_metadata)
         if person:
             contact = _get_or_create_contact(
                 db_session,
                 account_id=account.id,
                 name=person,
+                email=em,
             )
 
         budget_hint = _budget_from_extracted(extracted_data)
+        intent_hint = str(extracted_data.get("intent") or "").strip()
 
         deal = _create_deal(
             db_session,
             account_id=account.id,
             value=budget_hint or None,
+            intent_hint=intent_hint,
         )
 
         return {
@@ -261,12 +319,15 @@ def map_entities_to_crm(
     transcript: str,
     extracted_data: dict[str, Any],
     db_session: Session,
+    *,
+    source_metadata: dict[str, Any] | None = None,
 ) -> tuple[dict[str, int | None], str]:
     """
-    Try Gemini-assisted resolution against recent CRM rows; fall back to rule-based mapping.
+    Try Groq-assisted resolution against recent CRM rows; fall back to rule-based mapping.
 
     Returns (ids, method) where method is 'llm', 'rules', or 'rules_fallback'.
     """
+    meta = source_metadata if isinstance(source_metadata, dict) else None
     suggestion = llm_suggest_crm_links(db_session, transcript, extracted_data)
     if isinstance(suggestion, dict) and suggestion:
         try:
@@ -275,13 +336,19 @@ def map_entities_to_crm(
                 suggestion,
                 transcript,
                 extracted_data,
+                meta,
             )
             if mapped and mapped.get("account_id") is not None:
                 return mapped, "llm"
         except Exception:
             logger.exception("LLM CRM mapping application failed; using rules")
 
-    mapped = map_entities_to_crm_rules(transcript, extracted_data, db_session)
+    mapped = map_entities_to_crm_rules(
+        transcript,
+        extracted_data,
+        db_session,
+        source_metadata=meta,
+    )
     method = "rules_fallback" if suggestion is not None else "rules"
     return mapped, method
 

@@ -57,7 +57,7 @@ def transcribe_audio_detailed(file_path: str) -> dict:
     """
     Transcribe with per-segment timestamps (Whisper segments).
 
-    Speaker labels are not added here; use `label_segment_speakers` after Gemini.
+    Speaker labels are not added here; use `label_segment_speakers` after Groq (optional).
     """
     model = _get_whisper_model()
     result = model.transcribe(file_path)

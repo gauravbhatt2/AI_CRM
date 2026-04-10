@@ -1,5 +1,5 @@
 """
-Infer a speaker label per Whisper segment using Gemini (sales / prospect / names when obvious).
+Infer a speaker label per Whisper segment using Groq (sales / prospect / names when obvious).
 """
 
 from __future__ import annotations
@@ -7,40 +7,17 @@ from __future__ import annotations
 import json
 import logging
 import re
-import warnings
 from typing import Any
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", category=FutureWarning)
-    import google.generativeai as genai
+from openai import RateLimitError
 
 from app.core.config import settings
-from app.services.gemini_extraction import GEMINI_SAFETY_SETTINGS, extract_text_from_gemini_response
+from app.services.groq_llm import get_groq_client
+from app.utils.groq_retry import groq_chat_with_retry
 
 logger = logging.getLogger(__name__)
 
-_CONFIGURED = False
 _MAX_SEGMENTS = 100
-
-
-def _ensure_configured() -> None:
-    global _CONFIGURED
-    if _CONFIGURED:
-        return
-    key = settings.gemini_api_key
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
-    genai.configure(api_key=key)
-    _CONFIGURED = True
-
-
-def _resolve_model_name(name: str) -> str:
-    aliases = {
-        "gemini-1.5-flash": "gemini-2.5-flash",
-        "gemini-1.5-flash-8b": "gemini-2.5-flash",
-        "gemini-1.5-pro": "gemini-2.5-pro",
-    }
-    return aliases.get(name.strip().lower(), name.strip())
 
 
 def _strip_markdown_fences(raw: str) -> str:
@@ -61,15 +38,13 @@ def label_segment_speakers(segments: list[dict[str, Any]]) -> list[dict[str, Any
         return segments
     trimmed = segments[:_MAX_SEGMENTS]
     try:
-        _ensure_configured()
+        get_groq_client()
     except RuntimeError:
         return segments
 
-    raw_name = (settings.gemini_model or "").strip()
-    if not raw_name:
+    if not (settings.groq_model or "").strip():
         return segments
 
-    model_name = _resolve_model_name(raw_name)
     prompt = f"""You label speakers in a sales call transcript given as JSON segments with start/end times.
 For each segment, set "speaker" to a short label: e.g. "Sales", "Customer", or a first name if clearly inferable from the segment text.
 Use consistent labels when the same party speaks across segments.
@@ -79,17 +54,15 @@ Input segments:
 """
 
     try:
-        model = genai.GenerativeModel(
-            model_name,
-            safety_settings=GEMINI_SAFETY_SETTINGS,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-            ),
+        raw = groq_chat_with_retry(prompt, json_mode=True, max_attempts=2)
+    except RateLimitError:
+        logger.warning(
+            "Groq speaker labeling skipped (rate limit). "
+            "Set GROQ_LABEL_SPEAKERS=false to avoid this call.",
         )
-        response = model.generate_content(prompt)
-        raw = extract_text_from_gemini_response(response)
+        return segments
     except Exception:
-        logger.exception("Gemini speaker labeling failed")
+        logger.exception("Groq speaker labeling failed")
         return segments
 
     if not raw:

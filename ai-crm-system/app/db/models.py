@@ -5,7 +5,7 @@ SQLAlchemy ORM models for CRM persistence.
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func, text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -37,6 +37,7 @@ class Contact(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(512), nullable=False)
+    email: Mapped[str] = mapped_column(String(512), default="", server_default="")
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True)
 
     account: Mapped["Account"] = relationship(back_populates="contacts")
@@ -44,13 +45,15 @@ class Contact(Base):
 
 
 class Deal(Base):
-    """Opportunity linked to an account."""
+    """Opportunity linked to an account (FRD: stage, value, intent signal)."""
 
     __tablename__ = "deals"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True)
     value: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    stage: Mapped[str] = mapped_column(String(128), default="Open", server_default="Open")
+    intent_snapshot: Mapped[str] = mapped_column(String(512), default="", server_default="")
 
     account: Mapped["Account"] = relationship(back_populates="deals")
     crm_records: Mapped[list["CrmRecord"]] = relationship(back_populates="deal")
@@ -82,6 +85,12 @@ class CrmRecord(Base):
     )
 
     source_type: Mapped[str] = mapped_column(String(64), default="call", server_default="call")
+    external_interaction_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    participants: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
     source_metadata: Mapped[dict] = mapped_column(
         JSONB,
         nullable=False,
@@ -103,3 +112,20 @@ class CrmRecord(Base):
     account: Mapped["Account | None"] = relationship(back_populates="crm_records")
     contact: Mapped["Contact | None"] = relationship(back_populates="crm_records")
     deal: Mapped["Deal | None"] = relationship(back_populates="crm_records")
+
+
+class AuditLog(Base):
+    """DRD §3.5 — audit trail for ingestion and key CRM events (append-only)."""
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entity_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )

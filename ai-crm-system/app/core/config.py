@@ -1,19 +1,21 @@
-from dotenv import load_dotenv
-
-# Load .env before Settings reads environment variables
-load_dotenv()
-
 from functools import lru_cache
+from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Project root = directory that contains the `app` package (not process cwd).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_ENV_PATH = _PROJECT_ROOT / ".env"
+load_dotenv(_ENV_PATH)
 
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_PATH) if _ENV_PATH.is_file() else ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -33,21 +35,17 @@ class Settings(BaseSettings):
         "http://127.0.0.1:4173",
     ]
 
-    # --- Google Gemini (google-generativeai) ---
-    # API credentials and model id must come from the environment / .env — do not
-    # hardcode a model variant in application logic. Set GEMINI_MODEL to any model
-    # id your project can use. Gemini 1.5 names are retired — prefer gemini-2.5-flash or gemini-2.5-pro.
-    #
-    # Quotas are enforced per Google Cloud / AI Studio project and per model: the same
-    # API key may have different free-tier vs paid limits, and each model has its own
-    # request and token quotas. If you see 429 errors, switch GEMINI_MODEL to another
-    # model included in your plan, enable billing, or wait for quota reset — the app
-    # does not pick a model for you.
-    gemini_api_key: str | None = None
-    gemini_model: str = Field(
-        default="",
-        description="Model id from GEMINI_MODEL (e.g. gemini-2.5-flash). Must be set to run extraction.",
+    # --- Groq (OpenAI-compatible API at https://api.groq.com/openai/v1) ---
+    # Set GROQ_API_KEY and GROQ_MODEL in .env — see https://console.groq.com/docs/models
+    groq_api_key: str | None = None
+    groq_model: str = Field(
+        default="llama-3.3-70b-versatile",
+        description="Groq model id, e.g. llama-3.3-70b-versatile, mixtral-8x7b-32768",
     )
+
+    # Extra Groq call per audio file to label each Whisper segment (Sales / Customer / names).
+    # Set GROQ_LABEL_SPEAKERS=false to disable and save quota.
+    groq_label_speakers: bool = True
 
     # OpenAI Whisper (local); optional WHISPER_MODEL e.g. tiny, base, small, medium, large
     whisper_model: str = "base"

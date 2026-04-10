@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -13,6 +13,8 @@ import "./crm-app.css";
 const API_URL = "http://127.0.0.1:8000/ingest/audio";
 const TRANSCRIPT_API_URL = "http://127.0.0.1:8000/ingest/transcript";
 const REVENUE_API_URL = "http://127.0.0.1:8000/api/v1/analytics/revenue";
+const INSIGHTS_API_URL = "http://127.0.0.1:8000/api/v1/analytics/insights";
+const TIMELINE_API_URL = "http://127.0.0.1:8000/api/v1/interactions/timeline";
 const CRM_RECORDS_API_URL = "http://127.0.0.1:8000/api/v1/crm/records";
 
 function formatTimestamp(sec) {
@@ -43,6 +45,37 @@ function friendlyFetchError(message) {
   return message;
 }
 
+function parseApiError(text, status) {
+  try {
+    const data = text ? JSON.parse(text) : {};
+    if (typeof data.detail === "string") return data.detail;
+  } catch {
+    /* ignore */
+  }
+  return `Request failed (${status})`;
+}
+
+function excerpt(text, max = 220) {
+  const s = (text || "").trim();
+  if (!s) return "";
+  if (s.length <= max) return s;
+  return `${s.slice(0, max).trim()}…`;
+}
+
+function formatRecordWhen(iso) {
+  if (!iso) return null;
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  } catch {
+    return null;
+  }
+}
+
 function App() {
   const [inputMode, setInputMode] = useState("audio");
   const [textSource, setTextSource] = useState("call");
@@ -62,6 +95,17 @@ function App() {
   const [crmRecords, setCrmRecords] = useState(null);
   const [crmRecordsLoading, setCrmRecordsLoading] = useState(true);
   const [crmRecordsError, setCrmRecordsError] = useState(null);
+  const [recordsQuery, setRecordsQuery] = useState("");
+  const [recordsSourceFilter, setRecordsSourceFilter] = useState("all");
+  const [recordsDeleting, setRecordsDeleting] = useState(false);
+
+  const [insightsData, setInsightsData] = useState(null);
+  const [insightsLoading, setInsightsLoading] = useState(true);
+  const [insightsError, setInsightsError] = useState(null);
+
+  const [timelineItems, setTimelineItems] = useState(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState(null);
 
   const [activeSection, setActiveSection] = useState("dashboard");
 
@@ -90,22 +134,50 @@ function App() {
     [filteredRevenueRecords],
   );
 
+  const filteredCrmRecords = useMemo(() => {
+    if (!Array.isArray(crmRecords)) return [];
+    const q = recordsQuery.trim().toLowerCase();
+    return crmRecords.filter((r) => {
+      if (recordsSourceFilter !== "all") {
+        const st = (r.source_type || "").toLowerCase();
+        if (st !== recordsSourceFilter.toLowerCase()) return false;
+      }
+      if (!q) return true;
+      const hay = [
+        String(r.id),
+        r.content,
+        r.intent,
+        r.industry,
+        r.product,
+        r.timeline,
+        ...(Array.isArray(r.competitors) ? r.competitors : []),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(q);
+    });
+  }, [crmRecords, recordsQuery, recordsSourceFilter]);
+
   const resetAnalyticsFilters = () => {
     setAnalyticsBudgetMin("");
     setAnalyticsBudgetMax("");
     setAnalyticsIntent("all");
   };
 
-  const refreshDashboard = async () => {
+  const refreshDashboard = useCallback(async () => {
     try {
-      const [revRes, crmRes] = await Promise.all([
+      const [revRes, crmRes, insRes] = await Promise.all([
         fetch(REVENUE_API_URL, { mode: "cors", cache: "no-store" }),
         fetch(CRM_RECORDS_API_URL, { mode: "cors", cache: "no-store" }),
+        fetch(INSIGHTS_API_URL, { mode: "cors", cache: "no-store" }),
       ]);
       const revText = await revRes.text();
       const crmText = await crmRes.text();
+      const insText = await insRes.text();
       let revData = {};
       let crmData = [];
+      let insData = {};
       try {
         revData = revText ? JSON.parse(revText) : {};
       } catch {
@@ -116,6 +188,11 @@ function App() {
       } catch {
         /* ignore */
       }
+      try {
+        insData = insText ? JSON.parse(insText) : {};
+      } catch {
+        /* ignore */
+      }
       if (revRes.ok) {
         setRevenueData({
           total_records: revData.total_records ?? 0,
@@ -123,24 +200,105 @@ function App() {
           records: Array.isArray(revData.records) ? revData.records : [],
         });
         setRevenueError(null);
+      } else {
+        setRevenueError(
+          friendlyFetchError(parseApiError(revText, revRes.status)),
+        );
+        setRevenueData(null);
       }
       if (crmRes.ok) {
         setCrmRecords(Array.isArray(crmData) ? crmData : []);
         setCrmRecordsError(null);
+      } else {
+        setCrmRecordsError(
+          friendlyFetchError(parseApiError(crmText, crmRes.status)),
+        );
+        setCrmRecords(null);
       }
-    } catch {
-      /* non-fatal */
+      if (insRes.ok) {
+        setInsightsData(insData);
+        setInsightsError(null);
+      } else {
+        setInsightsError(
+          friendlyFetchError(parseApiError(insText, insRes.status)),
+        );
+        setInsightsData(null);
+      }
+    } catch (err) {
+      const raw =
+        err instanceof Error ? err.message : "Failed to refresh dashboard.";
+      setRevenueError(friendlyFetchError(raw));
+      setCrmRecordsError(friendlyFetchError(raw));
+      setInsightsError(friendlyFetchError(raw));
+    }
+  }, []);
+
+  const handleDeleteAllRecords = async () => {
+    if (
+      !window.confirm(
+        "Delete every CRM record in the database? This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    setRecordsDeleting(true);
+    setCrmRecordsError(null);
+    try {
+      const res = await fetch(CRM_RECORDS_API_URL, {
+        method: "DELETE",
+        mode: "cors",
+        cache: "no-store",
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        throw new Error(parseApiError(text, res.status));
+      }
+      await refreshDashboard();
+    } catch (err) {
+      const raw =
+        err instanceof Error ? err.message : "Failed to delete records.";
+      setCrmRecordsError(friendlyFetchError(raw));
+    } finally {
+      setRecordsDeleting(false);
     }
   };
 
   useEffect(() => {
     let cancelled = false;
 
-    async function fetchRevenue() {
+    async function loadDashboard() {
       setRevenueLoading(true);
+      setCrmRecordsLoading(true);
+      setInsightsLoading(true);
       setRevenueError(null);
+      setCrmRecordsError(null);
+      setInsightsError(null);
       try {
-        const res = await fetch(REVENUE_API_URL, {
+        await refreshDashboard();
+      } finally {
+        if (!cancelled) {
+          setRevenueLoading(false);
+          setCrmRecordsLoading(false);
+          setInsightsLoading(false);
+        }
+      }
+    }
+
+    loadDashboard();
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshDashboard]);
+
+  useEffect(() => {
+    if (activeSection !== "timeline") return;
+    let cancelled = false;
+
+    async function loadTimeline() {
+      setTimelineLoading(true);
+      setTimelineError(null);
+      try {
+        const res = await fetch(`${TIMELINE_API_URL}?limit=200`, {
           mode: "cors",
           cache: "no-store",
         });
@@ -152,82 +310,27 @@ function App() {
           throw new Error(text || `Request failed (${res.status})`);
         }
         if (!res.ok) {
-          const detail =
-            typeof data.detail === "string"
-              ? data.detail
-              : `Request failed (${res.status})`;
-          throw new Error(detail);
+          throw new Error(parseApiError(text, res.status));
         }
-        if (!cancelled) {
-          setRevenueData({
-            total_records: data.total_records ?? 0,
-            total_budget: data.total_budget ?? 0,
-            records: Array.isArray(data.records) ? data.records : [],
-          });
-        }
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (!cancelled) setTimelineItems(items);
       } catch (err) {
         const raw =
-          err instanceof Error ? err.message : "Failed to load revenue data.";
+          err instanceof Error ? err.message : "Failed to load timeline.";
         if (!cancelled) {
-          setRevenueError(friendlyFetchError(raw));
-          setRevenueData(null);
+          setTimelineError(friendlyFetchError(raw));
+          setTimelineItems(null);
         }
       } finally {
-        if (!cancelled) setRevenueLoading(false);
+        if (!cancelled) setTimelineLoading(false);
       }
     }
 
-    fetchRevenue();
+    loadTimeline();
     return () => {
       cancelled = true;
     };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function fetchCrmRecords() {
-      setCrmRecordsLoading(true);
-      setCrmRecordsError(null);
-      try {
-        const res = await fetch(CRM_RECORDS_API_URL, {
-          mode: "cors",
-          cache: "no-store",
-        });
-        const text = await res.text();
-        let data;
-        try {
-          data = text ? JSON.parse(text) : [];
-        } catch {
-          throw new Error(text || `Request failed (${res.status})`);
-        }
-        if (!res.ok) {
-          const detail =
-            typeof data.detail === "string"
-              ? data.detail
-              : `Request failed (${res.status})`;
-          throw new Error(detail);
-        }
-        if (!cancelled) {
-          setCrmRecords(Array.isArray(data) ? data : []);
-        }
-      } catch (err) {
-        const raw =
-          err instanceof Error ? err.message : "Failed to load CRM records.";
-        if (!cancelled) {
-          setCrmRecordsError(friendlyFetchError(raw));
-          setCrmRecords(null);
-        }
-      } finally {
-        if (!cancelled) setCrmRecordsLoading(false);
-      }
-    }
-
-    fetchCrmRecords();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  }, [activeSection]);
 
   const handleFileChange = (e) => {
     const f = e.target.files?.[0] ?? null;
@@ -525,6 +628,7 @@ function App() {
           <nav className="crm-nav">
             {[
               ["dashboard", "Dashboard"],
+              ["timeline", "Timeline"],
               ["upload", "Upload"],
               ["analytics", "Analytics"],
               ["records", "CRM Records"],
@@ -591,8 +695,83 @@ function App() {
                   </div>
                   <div className="crm-dash-hint">
                     <strong>Tip:</strong> Use <strong>Upload</strong> to ingest
-                    audio or text, <strong>Analytics</strong> for the budget
-                    chart, and <strong>CRM Records</strong> for the full table.
+                    audio or text, <strong>Timeline</strong> for unified
+                    history, <strong>Analytics</strong> for charts, and{" "}
+                    <strong>CRM Records</strong> to browse extracted
+                    interactions.
+                  </div>
+                  <div className="crm-card crm-dash-panel" style={{ marginTop: "1rem" }}>
+                    <p className="crm-section-title">Interaction insights</p>
+                    {insightsLoading && (
+                      <p className="crm-revenue-loading" role="status">
+                        Loading insights…
+                      </p>
+                    )}
+                    {!insightsLoading && insightsError && (
+                      <p className="crm-revenue-err" role="alert">
+                        {insightsError}
+                      </p>
+                    )}
+                    {!insightsLoading && !insightsError && insightsData && (
+                      <>
+                        <div className="crm-dash-stats">
+                          <div className="crm-dash-stat">
+                            <div className="crm-dash-stat-label">
+                              Avg budget (parsed)
+                            </div>
+                            <div className="crm-dash-stat-value">
+                              {Number(
+                                insightsData.avg_budget ?? 0,
+                              ).toLocaleString(undefined, {
+                                maximumFractionDigits: 0,
+                              })}
+                            </div>
+                          </div>
+                          <div className="crm-dash-stat">
+                            <div className="crm-dash-stat-label">
+                              Intent · strong signals
+                            </div>
+                            <div className="crm-dash-stat-value">
+                              {(
+                                insightsData.intent_keywords_high ?? 0
+                              ).toLocaleString()}
+                            </div>
+                          </div>
+                          <div className="crm-dash-stat">
+                            <div className="crm-dash-stat-label">
+                              Intent · exploratory
+                            </div>
+                            <div className="crm-dash-stat-value">
+                              {(
+                                insightsData.intent_keywords_low ?? 0
+                              ).toLocaleString()}
+                            </div>
+                          </div>
+                        </div>
+                        {insightsData.by_source_type &&
+                        typeof insightsData.by_source_type === "object" &&
+                        Object.keys(insightsData.by_source_type).length > 0 ? (
+                          <div className="crm-insights-sources">
+                            <span className="crm-record-tags-lbl">
+                              By channel
+                            </span>
+                            <div className="crm-record-tag-row">
+                              {Object.entries(insightsData.by_source_type).map(
+                                ([src, n]) => (
+                                  <span
+                                    key={src}
+                                    className="crm-record-tag"
+                                    title={`${n} record(s)`}
+                                  >
+                                    {src}: {n}
+                                  </span>
+                                ),
+                              )}
+                            </div>
+                          </div>
+                        ) : null}
+                      </>
+                    )}
                   </div>
                   <div className="crm-dash-actions">
                     <button
@@ -601,6 +780,13 @@ function App() {
                       onClick={() => setActiveSection("upload")}
                     >
                       New upload
+                    </button>
+                    <button
+                      type="button"
+                      className="crm-dash-action"
+                      onClick={() => setActiveSection("timeline")}
+                    >
+                      Open timeline
                     </button>
                     <button
                       type="button"
@@ -621,12 +807,121 @@ function App() {
               </>
             )}
 
+            {activeSection === "timeline" && (
+              <>
+                <div className="crm-page-head">
+                  <h1 className="crm-page-title">Interaction timeline</h1>
+                  <p className="crm-page-desc">
+                    Unified history of captured interactions (newest first). Matches
+                    FRD 2.4 automated capture and DRD interaction metadata.
+                  </p>
+                </div>
+
+                <div className="crm-card crm-records-card">
+                  {timelineLoading && (
+                    <p className="crm-records-loading" role="status">
+                      Loading timeline…
+                    </p>
+                  )}
+                  {!timelineLoading && timelineError && (
+                    <p className="crm-records-err" role="alert">
+                      {timelineError}
+                    </p>
+                  )}
+                  {!timelineLoading &&
+                    !timelineError &&
+                    Array.isArray(timelineItems) &&
+                    timelineItems.length === 0 && (
+                      <p className="crm-records-empty">
+                        No interactions yet. Use <strong>Upload</strong> to ingest
+                        a call, email, or other channel.
+                      </p>
+                    )}
+                  {!timelineLoading &&
+                    !timelineError &&
+                    timelineItems &&
+                    timelineItems.length > 0 && (
+                      <ul className="crm-record-list">
+                        {timelineItems.map((t) => {
+                          const when = formatRecordWhen(t.created_at);
+                          const plist = Array.isArray(t.participants)
+                            ? t.participants.filter(Boolean)
+                            : [];
+                          return (
+                            <li key={t.id}>
+                              <div className="crm-record-card crm-timeline-card">
+                                <div className="crm-record-summary">
+                                  <span className="crm-record-summary-top">
+                                    <span className="crm-record-id">#{t.id}</span>
+                                    <span className="crm-meta-pill">
+                                      {t.source_type || "—"}
+                                    </span>
+                                    {when ? (
+                                      <span className="crm-record-when">
+                                        {when}
+                                      </span>
+                                    ) : null}
+                                  </span>
+                                  <span className="crm-record-metrics">
+                                    <span className="crm-record-metric">
+                                      <span className="crm-record-metric-lbl">
+                                        Budget
+                                      </span>
+                                      <span className="crm-record-metric-val">
+                                        {typeof t.budget_parsed === "number"
+                                          ? t.budget_parsed.toLocaleString()
+                                          : "—"}
+                                      </span>
+                                    </span>
+                                    <span className="crm-record-metric">
+                                      <span className="crm-record-metric-lbl">
+                                        Intent
+                                      </span>
+                                      <span className="crm-record-metric-val crm-record-metric-val--clip">
+                                        {t.intent?.trim() ? t.intent : "—"}
+                                      </span>
+                                    </span>
+                                  </span>
+                                  <span className="crm-record-excerpt">
+                                    {t.content_excerpt || "—"}
+                                  </span>
+                                </div>
+                                <div className="crm-timeline-meta">
+                                  {t.external_interaction_id ? (
+                                    <span className="crm-meta-pill">
+                                      ext: {t.external_interaction_id}
+                                    </span>
+                                  ) : null}
+                                  {plist.length > 0 ? (
+                                    <span className="crm-meta-pill">
+                                      {plist.slice(0, 4).join(" · ")}
+                                      {plist.length > 4
+                                        ? ` +${plist.length - 4}`
+                                        : ""}
+                                    </span>
+                                  ) : null}
+                                  <span className="crm-meta-pill">
+                                    A{t.account_id ?? "—"} · C
+                                    {t.contact_id ?? "—"} · D
+                                    {t.deal_id ?? "—"}
+                                  </span>
+                                </div>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                </div>
+              </>
+            )}
+
             {activeSection === "upload" && (
               <>
                 <div className="crm-page-head">
                   <h1 className="crm-page-title">Upload</h1>
                   <p className="crm-page-desc">
-                    Transcribe calls (Whisper), extract CRM fields (Gemini), and
+                    Transcribe calls (Whisper), extract CRM fields (Groq), and
                     map entities — audio/video or paste text with channel type.
                   </p>
                 </div>
@@ -1030,12 +1325,68 @@ function App() {
                 <div className="crm-page-head">
                   <h1 className="crm-page-title">CRM Records</h1>
                   <p className="crm-page-desc">
-                    All ingested rows with mapped account, contact, and deal
-                    ids.
+                    Interaction mining output: budget, intent, mapping, and
+                    transcript excerpts—search and open a card for full detail.
                   </p>
                 </div>
 
                 <div className="crm-card crm-records-card">
+                  <div className="crm-records-toolbar">
+                    <div className="crm-records-toolbar-main">
+                      <label className="crm-records-search-wrap">
+                        <span className="crm-sr-only">Search records</span>
+                        <input
+                          type="search"
+                          className="crm-records-search"
+                          placeholder="Search id, transcript, intent, industry…"
+                          value={recordsQuery}
+                          onChange={(e) => setRecordsQuery(e.target.value)}
+                          aria-label="Filter CRM records"
+                        />
+                      </label>
+                      <div
+                        className="crm-source-chips"
+                        role="group"
+                        aria-label="Filter by source"
+                      >
+                        {[
+                          ["all", "All"],
+                          ["call", "Call"],
+                          ["email", "Email"],
+                          ["meeting", "Meeting"],
+                          ["sms", "SMS"],
+                          ["crm_update", "CRM"],
+                        ].map(([id, label]) => (
+                          <button
+                            key={id}
+                            type="button"
+                            className={
+                              "crm-chip" +
+                              (recordsSourceFilter === id
+                                ? " crm-chip--on"
+                                : "")
+                            }
+                            onClick={() => setRecordsSourceFilter(id)}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="crm-records-danger"
+                      onClick={handleDeleteAllRecords}
+                      disabled={
+                        recordsDeleting ||
+                        crmRecordsLoading ||
+                        !crmRecords?.length
+                      }
+                    >
+                      {recordsDeleting ? "Clearing…" : "Delete all records"}
+                    </button>
+                  </div>
+
                   {crmRecordsLoading && (
                     <p className="crm-records-loading" role="status">
                       Loading records...
@@ -1053,59 +1404,208 @@ function App() {
                     crmRecords &&
                     crmRecords.length === 0 && (
                       <p className="crm-records-empty">
-                        No CRM records yet. Ingest a transcript or audio to see
-                        rows here.
+                        No CRM records yet. Ingest a transcript or audio from{" "}
+                        <strong>Upload</strong> to see interactions here.
                       </p>
                     )}
 
                   {!crmRecordsLoading &&
                     !crmRecordsError &&
                     crmRecords &&
-                    crmRecords.length > 0 && (
-                      <div className="crm-table-wrap">
-                        <table className="crm-table">
-                          <thead>
-                            <tr>
-                              <th>ID</th>
-                              <th>Source</th>
-                              <th>Budget</th>
-                              <th>Intent</th>
-                              <th>Industry</th>
-                              <th>Timeline</th>
-                              <th>Acct</th>
-                              <th>Contact</th>
-                              <th>Deal</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {crmRecords.map((row) => (
-                              <tr key={row.id}>
-                                <td className="crm-td-mono">{row.id}</td>
-                                <td className="crm-td-muted">
-                                  {row.source_type || "—"}
-                                </td>
-                                <td className="crm-td-mono">
-                                  {typeof row.budget === "number"
-                                    ? row.budget.toLocaleString()
-                                    : "—"}
-                                </td>
-                                <td>{row.intent || "—"}</td>
-                                <td>{row.industry || "—"}</td>
-                                <td>{row.timeline || "—"}</td>
-                                <td className="crm-td-mono crm-td-muted">
-                                  {row.account_id ?? "—"}
-                                </td>
-                                <td className="crm-td-mono crm-td-muted">
-                                  {row.contact_id ?? "—"}
-                                </td>
-                                <td className="crm-td-mono crm-td-muted">
-                                  {row.deal_id ?? "—"}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
+                    crmRecords.length > 0 &&
+                    filteredCrmRecords.length === 0 && (
+                      <p className="crm-records-empty" role="status">
+                        No records match your filters.{" "}
+                        <button
+                          type="button"
+                          className="crm-records-reset-filters"
+                          onClick={() => {
+                            setRecordsQuery("");
+                            setRecordsSourceFilter("all");
+                          }}
+                        >
+                          Reset filters
+                        </button>
+                      </p>
+                    )}
+
+                  {!crmRecordsLoading &&
+                    !crmRecordsError &&
+                    filteredCrmRecords.length > 0 && (
+                      <ul className="crm-record-list">
+                        {filteredCrmRecords.map((row) => {
+                          const when = formatRecordWhen(row.created_at);
+                          const customEntries =
+                            row.custom_fields &&
+                            typeof row.custom_fields === "object"
+                              ? Object.entries(row.custom_fields).filter(
+                                  ([, v]) =>
+                                    v != null && String(v).trim() !== "",
+                                )
+                              : [];
+                          return (
+                            <li key={row.id}>
+                              <details className="crm-record-card">
+                                <summary className="crm-record-summary">
+                                  <span className="crm-record-summary-top">
+                                    <span className="crm-record-id">
+                                      #{row.id}
+                                    </span>
+                                    <span className="crm-meta-pill">
+                                      {row.source_type || "—"}
+                                    </span>
+                                    {when ? (
+                                      <span className="crm-record-when">
+                                        {when}
+                                      </span>
+                                    ) : null}
+                                  </span>
+                                  <span className="crm-record-metrics">
+                                    <span className="crm-record-metric">
+                                      <span className="crm-record-metric-lbl">
+                                        Budget
+                                      </span>
+                                      <span className="crm-record-metric-val">
+                                        {typeof row.budget === "number"
+                                          ? row.budget.toLocaleString()
+                                          : "—"}
+                                      </span>
+                                    </span>
+                                    <span className="crm-record-metric">
+                                      <span className="crm-record-metric-lbl">
+                                        Intent
+                                      </span>
+                                      <span className="crm-record-metric-val crm-record-metric-val--clip">
+                                        {row.intent?.trim()
+                                          ? row.intent
+                                          : "—"}
+                                      </span>
+                                    </span>
+                                    <span className="crm-record-metric">
+                                      <span className="crm-record-metric-lbl">
+                                        Industry
+                                      </span>
+                                      <span className="crm-record-metric-val crm-record-metric-val--clip">
+                                        {row.industry?.trim()
+                                          ? row.industry
+                                          : "—"}
+                                      </span>
+                                    </span>
+                                  </span>
+                                  <span className="crm-record-excerpt">
+                                    {excerpt(row.content) || "—"}
+                                  </span>
+                                </summary>
+                                <div className="crm-record-body">
+                                  {(row.external_interaction_id ||
+                                    (Array.isArray(row.participants) &&
+                                      row.participants.length > 0)) && (
+                                    <p className="crm-record-detail-meta">
+                                      {row.external_interaction_id ? (
+                                        <span className="crm-meta-pill">
+                                          ext: {row.external_interaction_id}
+                                        </span>
+                                      ) : null}
+                                      {Array.isArray(row.participants) &&
+                                      row.participants.length > 0 ? (
+                                        <span className="crm-meta-pill">
+                                          {row.participants
+                                            .slice(0, 6)
+                                            .filter(Boolean)
+                                            .join(" · ")}
+                                          {row.participants.length > 6
+                                            ? ` +${row.participants.length - 6}`
+                                            : ""}
+                                        </span>
+                                      ) : null}
+                                    </p>
+                                  )}
+                                  <div className="crm-record-links">
+                                    <span className="crm-record-links-lbl">
+                                      CRM links
+                                    </span>
+                                    <div className="crm-record-link-chips">
+                                      <span className="crm-id-chip">
+                                        <span className="crm-id-chip-lbl">
+                                          Account
+                                        </span>
+                                        {row.account_id ?? "—"}
+                                      </span>
+                                      <span className="crm-id-chip">
+                                        <span className="crm-id-chip-lbl">
+                                          Contact
+                                        </span>
+                                        {row.contact_id ?? "—"}
+                                      </span>
+                                      <span className="crm-id-chip">
+                                        <span className="crm-id-chip-lbl">
+                                          Deal
+                                        </span>
+                                        {row.deal_id ?? "—"}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <p className="crm-record-detail-meta">
+                                    <span className="crm-meta-pill">
+                                      {row.mapping_method || "—"} ·{" "}
+                                      {row.product?.trim()
+                                        ? `Product: ${row.product}`
+                                        : "Product: —"}{" "}
+                                      ·{" "}
+                                      {row.timeline?.trim()
+                                        ? `Timeline: ${row.timeline}`
+                                        : "Timeline: —"}
+                                    </span>
+                                  </p>
+                                  {Array.isArray(row.competitors) &&
+                                  row.competitors.length > 0 ? (
+                                    <div className="crm-record-tags">
+                                      <span className="crm-record-tags-lbl">
+                                        Competitors
+                                      </span>
+                                      <div className="crm-record-tag-row">
+                                        {row.competitors.map((c, i) => (
+                                          <span
+                                            key={i}
+                                            className="crm-record-tag"
+                                          >
+                                            {c}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {customEntries.length > 0 ? (
+                                    <div className="crm-record-custom">
+                                      <span className="crm-record-tags-lbl">
+                                        Custom fields
+                                      </span>
+                                      <div className="crm-kv-grid">
+                                        {customEntries.map(([k, v]) => (
+                                          <div key={k} className="crm-kv">
+                                            <div className="crm-kv-k">{k}</div>
+                                            <div className="crm-kv-v">
+                                              {String(v)}
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  <div className="crm-record-transcript-block">
+                                    <p className="crm-section-title">
+                                      Source text
+                                    </p>
+                                    <div className="crm-transcript crm-transcript--records">
+                                      {row.content || "—"}
+                                    </div>
+                                  </div>
+                                </div>
+                              </details>
+                            </li>
+                          );
+                        })}
+                      </ul>
                     )}
                 </div>
               </>

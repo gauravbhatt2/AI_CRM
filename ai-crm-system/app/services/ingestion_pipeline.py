@@ -1,14 +1,17 @@
 """
-Shared ingestion: Gemini extraction → CRM mapping → persist crm_record.
+Shared ingestion: Groq extraction → CRM mapping → persist crm_record.
 """
 
 from __future__ import annotations
 
 import asyncio
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.db.audit_repository import log_audit_event
 from app.db.crm_record_repository import create_crm_record
+from app.db.models import CrmRecord
 from app.ingestion.receiver import TranscriptReceiver
 from app.models.ingestion import (
     AudioIngestResponse,
@@ -20,13 +23,31 @@ from app.services.extraction_service import extract_entities
 from app.services.mapping_service import map_entities_to_crm
 
 
-async def run_gemini_pipeline(
+def _merge_participants(meta: dict, explicit: list[str] | None) -> list[str]:
+    """DRD participants: union of explicit list and metadata.participants."""
+    out: list[str] = []
+    if explicit:
+        for p in explicit:
+            s = str(p).strip()
+            if s and s not in out:
+                out.append(s[:512])
+    raw = meta.get("participants")
+    if isinstance(raw, list):
+        for p in raw:
+            s = str(p).strip()
+            if s and s not in out:
+                out.append(s[:512])
+    return out[:64]
+
+
+async def run_transcript_pipeline(
     *,
     transcript: str,
     db: Session,
     receiver: TranscriptReceiver,
     metadata: dict | None = None,
     external_id: str | None = None,
+    participants: list[str] | None = None,
     source_type: str = "call",
     structured_transcript: StructuredTranscript | None = None,
 ) -> TranscriptIngestResponse:
@@ -36,9 +57,31 @@ async def run_gemini_pipeline(
         metadata=metadata,
         external_id=external_id,
     )
+    meta = dict(metadata or {})
+    if external_id:
+        meta.setdefault("external_id", external_id)
+    plist = _merge_participants(meta, participants)
+    ext_key = (external_id or str(meta.get("external_id") or "")).strip()[:256] or None
+
+    prior_same_external = 0
+    if ext_key:
+        prior_same_external = (
+            db.scalar(
+                select(func.count())
+                .select_from(CrmRecord)
+                .where(CrmRecord.external_interaction_id == ext_key),
+            )
+            or 0
+        )
+
     extracted_raw = await asyncio.to_thread(extract_entities, transcript)
     extracted = ExtractedEntities.model_validate(extracted_raw)
-    mapped, map_method = map_entities_to_crm(transcript, extracted.model_dump(), db)
+    mapped, map_method = map_entities_to_crm(
+        transcript,
+        extracted.model_dump(),
+        db,
+        source_metadata=meta,
+    )
     record = create_crm_record(
         db,
         content=transcript,
@@ -47,9 +90,24 @@ async def run_gemini_pipeline(
         contact_id=mapped.get("contact_id"),
         deal_id=mapped.get("deal_id"),
         source_type=source_type,
-        source_metadata=metadata,
+        source_metadata=meta,
         structured_transcript=structured_transcript,
         mapping_method=map_method,
+        external_interaction_id=ext_key,
+        participants=plist,
+    )
+    log_audit_event(
+        db,
+        event_type="ingestion_completed",
+        entity_table="crm_records",
+        entity_id=record.id,
+        detail={
+            "job_id": ctx.job_id,
+            "source_type": source_type,
+            "external_interaction_id": ext_key,
+            "mapping_method": map_method,
+            "dedup_prior_count": int(prior_same_external),
+        },
     )
     return TranscriptIngestResponse(
         job_id=ctx.job_id,

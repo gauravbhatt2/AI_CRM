@@ -117,6 +117,66 @@ def _ensure_crm_records_extended_columns(engine: Engine) -> None:
             conn.execute(text(stmt))
 
 
+def _ensure_contacts_email_column(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE contacts
+                ADD COLUMN IF NOT EXISTS email VARCHAR(512) NOT NULL DEFAULT ''
+                """
+            )
+        )
+
+
+def _ensure_deals_stage_columns(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    stmts = (
+        """
+        ALTER TABLE deals
+        ADD COLUMN IF NOT EXISTS stage VARCHAR(128) NOT NULL DEFAULT 'Open'
+        """,
+        """
+        ALTER TABLE deals
+        ADD COLUMN IF NOT EXISTS intent_snapshot VARCHAR(512) NOT NULL DEFAULT ''
+        """,
+    )
+    with engine.begin() as conn:
+        for s in stmts:
+            conn.execute(text(s))
+
+
+def _ensure_crm_records_interaction_columns(engine: Engine) -> None:
+    """DRD: external interaction id, participants list."""
+    from sqlalchemy import text
+
+    stmts = (
+        """
+        ALTER TABLE crm_records
+        ADD COLUMN IF NOT EXISTS external_interaction_id VARCHAR(256)
+        """,
+        """
+        ALTER TABLE crm_records
+        ADD COLUMN IF NOT EXISTS participants JSONB NOT NULL DEFAULT '[]'::jsonb
+        """,
+    )
+    with engine.begin() as conn:
+        for s in stmts:
+            conn.execute(text(s))
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_crm_records_external_interaction_id
+                ON crm_records (external_interaction_id)
+                """
+            )
+        )
+
+
 def init_db() -> None:
     """Create all tables defined on Base (idempotent) and align legacy schema."""
     init_engine()
@@ -128,3 +188,6 @@ def init_db() -> None:
     _models.Base.metadata.create_all(bind=_engine)
     _ensure_crm_records_fk_columns(_engine)
     _ensure_crm_records_extended_columns(_engine)
+    _ensure_contacts_email_column(_engine)
+    _ensure_deals_stage_columns(_engine)
+    _ensure_crm_records_interaction_columns(_engine)

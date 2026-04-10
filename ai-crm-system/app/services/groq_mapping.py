@@ -1,5 +1,5 @@
 """
-Gemini-assisted resolution of transcript + extraction to existing CRM rows (entity resolution).
+Groq-assisted resolution of transcript + extraction to existing CRM rows (entity resolution).
 """
 
 from __future__ import annotations
@@ -7,43 +7,18 @@ from __future__ import annotations
 import json
 import logging
 import re
-import warnings
 from typing import Any
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", category=FutureWarning)
-    import google.generativeai as genai
-
+from openai import RateLimitError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.models import Account, Contact
-from app.services.gemini_extraction import GEMINI_SAFETY_SETTINGS, extract_text_from_gemini_response
+from app.services.groq_llm import get_groq_client
+from app.utils.groq_retry import groq_chat_with_retry
 
 logger = logging.getLogger(__name__)
-
-_CONFIGURED = False
-
-
-def _ensure_configured() -> None:
-    global _CONFIGURED
-    if _CONFIGURED:
-        return
-    key = settings.gemini_api_key
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
-    genai.configure(api_key=key)
-    _CONFIGURED = True
-
-
-def _resolve_model_name(name: str) -> str:
-    aliases = {
-        "gemini-1.5-flash": "gemini-2.5-flash",
-        "gemini-1.5-flash-8b": "gemini-2.5-flash",
-        "gemini-1.5-pro": "gemini-2.5-pro",
-    }
-    return aliases.get(name.strip().lower(), name.strip())
 
 
 def _strip_markdown_fences(raw: str) -> str:
@@ -70,17 +45,16 @@ def llm_suggest_crm_links(
     extracted: dict[str, Any],
 ) -> dict[str, Any] | None:
     """
-    Ask Gemini to pick existing account/contact ids or suggest canonical company and person names.
+    Ask Groq to pick existing account/contact ids or suggest canonical company and person names.
 
     Returns None on any failure (caller falls back to rules).
     """
     try:
-        _ensure_configured()
+        get_groq_client()
     except RuntimeError:
         return None
 
-    raw_name = (settings.gemini_model or "").strip()
-    if not raw_name:
+    if not (settings.groq_model or "").strip():
         return None
 
     accounts = _recent_accounts(db)
@@ -121,19 +95,13 @@ Conversation:
 {transcript.strip()[:24000]}
 """
 
-    model_name = _resolve_model_name(raw_name)
     try:
-        model = genai.GenerativeModel(
-            model_name,
-            safety_settings=GEMINI_SAFETY_SETTINGS,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-            ),
-        )
-        response = model.generate_content(prompt)
-        raw = extract_text_from_gemini_response(response)
+        raw = groq_chat_with_retry(prompt, json_mode=True, max_attempts=2)
+    except RateLimitError as e:
+        logger.warning("Groq CRM mapping skipped (rate limit): %s", e)
+        return None
     except Exception:
-        logger.exception("Gemini CRM mapping request failed")
+        logger.exception("Groq CRM mapping request failed")
         return None
 
     if not raw:
@@ -141,7 +109,7 @@ Conversation:
     try:
         parsed = json.loads(_strip_markdown_fences(raw))
     except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning("Gemini CRM mapping JSON parse failed")
+        logger.warning("Groq CRM mapping JSON parse failed")
         return None
     if not isinstance(parsed, dict):
         return None

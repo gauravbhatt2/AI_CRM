@@ -16,8 +16,12 @@ from app.models.ingestion import (
     TranscriptIngestRequest,
     TranscriptIngestResponse,
 )
-from app.services.gemini_speakers import label_segment_speakers
-from app.services.ingestion_pipeline import build_audio_ingest_response, run_gemini_pipeline
+from app.db.crm_record_repository import (
+    update_crm_record_content,
+    update_crm_record_structured_transcript,
+)
+from app.services.groq_speakers import label_segment_speakers
+from app.services.ingestion_pipeline import build_audio_ingest_response, run_transcript_pipeline
 from app.services.transcription_service import WhisperNotInstalledError, transcribe_audio_detailed
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
@@ -25,18 +29,33 @@ router = APIRouter(prefix="/ingest", tags=["ingestion"])
 _receiver = TranscriptReceiver()
 
 
-def _require_gemini() -> None:
-    if not settings.gemini_api_key:
+def _transcript_with_speaker_labels(structured: StructuredTranscript, fallback: str) -> str:
+    """Build readable lines like 'Sales: …' / 'Customer: …' from labeled segments."""
+    segs = structured.segments or []
+    if not segs:
+        return fallback
+    lines: list[str] = []
+    for seg in segs:
+        t = (seg.text or "").strip()
+        if not t:
+            continue
+        sp = (seg.speaker or "").strip()
+        lines.append(f"{sp}: {t}" if sp else t)
+    return "\n".join(lines) if lines else fallback
+
+
+def _require_groq() -> None:
+    if not settings.groq_api_key:
         raise HTTPException(
             status_code=503,
-            detail="GEMINI_API_KEY is not configured. Set it in the environment or .env file.",
+            detail="GROQ_API_KEY is not configured. Set it in the environment or .env file.",
         )
-    if not (settings.gemini_model or "").strip():
+    if not (settings.groq_model or "").strip():
         raise HTTPException(
             status_code=503,
             detail=(
-                "GEMINI_MODEL is not configured. Set it in the environment or .env file "
-                "(e.g. GEMINI_MODEL=gemini-2.5-flash) to choose which Gemini model to use."
+                "GROQ_MODEL is not configured. Set it in the environment or .env file "
+                "(e.g. GROQ_MODEL=llama-3.3-70b-versatile)."
             ),
         )
 
@@ -47,15 +66,18 @@ async def ingest_transcript(
     db: Session = Depends(get_db),
 ) -> TranscriptIngestResponse:
     """
-    Accept a transcript, run Gemini extraction, and return structured CRM fields.
+    Accept a transcript, run Groq extraction, and return structured CRM fields.
     """
-    _require_gemini()
-    return await run_gemini_pipeline(
+    _require_groq()
+    meta = dict(body.metadata or {})
+    meta.setdefault("source_type", body.source_type)
+    return await run_transcript_pipeline(
         transcript=body.content,
         db=db,
         receiver=_receiver,
-        metadata=body.metadata,
+        metadata=meta,
         external_id=body.external_id,
+        participants=body.participants,
         source_type=body.source_type,
     )
 
@@ -68,14 +90,16 @@ async def ingest_interaction(
     """
     Ingest text from email, SMS, meetings, CRM webhooks, or calls — same pipeline as `/transcript`.
     """
-    _require_gemini()
+    _require_groq()
     meta = dict(body.metadata or {})
-    return await run_gemini_pipeline(
+    meta.setdefault("source_type", body.source_type)
+    return await run_transcript_pipeline(
         transcript=body.content,
         db=db,
         receiver=_receiver,
         metadata=meta,
         external_id=body.external_id,
+        participants=body.participants,
         source_type=body.source_type,
     )
 
@@ -92,7 +116,7 @@ async def ingest_audio(
     Upload audio or video, transcribe with Whisper (timestamped segments), optional speaker labels,
     then run the same extraction + CRM pipeline as `/ingest/transcript`.
     """
-    _require_gemini()
+    _require_groq()
 
     suffix = Path(file.filename or "audio.wav").suffix
     if not suffix or len(suffix) > 10:
@@ -120,14 +144,9 @@ async def ingest_audio(
             )
 
         segments = detail.get("segments") or []
-        try:
-            labeled = await asyncio.to_thread(label_segment_speakers, segments)
-        except Exception:
-            labeled = segments
+        structured = StructuredTranscript(plain_text=plain, segments=segments or [])
 
-        structured = StructuredTranscript(plain_text=plain, segments=labeled or [])
-
-        base = await run_gemini_pipeline(
+        base = await run_transcript_pipeline(
             transcript=plain,
             db=db,
             receiver=_receiver,
@@ -136,9 +155,37 @@ async def ingest_audio(
             source_type="call",
             structured_transcript=structured,
         )
+
+        out_structured = structured
+        if settings.groq_label_speakers and segments:
+            try:
+                labeled = await asyncio.to_thread(label_segment_speakers, segments)
+                out_structured = StructuredTranscript(
+                    plain_text=plain,
+                    segments=labeled or segments,
+                )
+                update_crm_record_structured_transcript(
+                    db,
+                    base.record_id,
+                    out_structured,
+                )
+            except Exception:
+                out_structured = structured
+
+        has_speakers = any(
+            (seg.speaker or "").strip() for seg in (out_structured.segments or [])
+        )
+        display_transcript = (
+            _transcript_with_speaker_labels(out_structured, plain)
+            if has_speakers
+            else plain
+        )
+        if has_speakers and display_transcript != plain:
+            update_crm_record_content(db, base.record_id, display_transcript)
+
         return build_audio_ingest_response(
-            transcript=plain,
-            structured=structured,
+            transcript=display_transcript,
+            structured=out_structured,
             base=base,
         )
     finally:

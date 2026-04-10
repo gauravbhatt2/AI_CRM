@@ -1,6 +1,6 @@
 # CRM_AI — AI-assisted CRM ingestion
 
-Monorepo with a **FastAPI** backend that ingests transcripts or audio, extracts structured CRM fields with **Google Gemini**, maps entities to accounts/contacts/deals, and persists results in **PostgreSQL**. A **Vite + React** dashboard uploads content, shows extraction results, and surfaces analytics.
+Monorepo with a **FastAPI** backend that ingests transcripts or audio, extracts structured CRM fields with **Groq** (OpenAI-compatible API), maps entities to accounts/contacts/deals, and persists results in **PostgreSQL**. A **Vite + React** dashboard uploads content, shows extraction results, and surfaces analytics.
 
 ## Repository layout
 
@@ -39,8 +39,8 @@ Create `ai-crm-system/.env` (do not commit secrets). Typical variables:
 | Variable | Purpose |
 |----------|---------|
 | `DATABASE_URL` | PostgreSQL connection string, e.g. `postgresql://user:pass@localhost:5432/dbname` |
-| `GEMINI_API_KEY` | Google Generative AI (Gemini) API key |
-| `GEMINI_MODEL` | Model id, e.g. `gemini-2.5-flash` |
+| `GROQ_API_KEY` | API key from [Groq Console](https://console.groq.com/keys) |
+| `GROQ_MODEL` | Model id, e.g. `llama-3.3-70b-versatile` (see [Groq models](https://console.groq.com/docs/models)) |
 | `WHISPER_MODEL` | Optional; Whisper size: `tiny`, `base`, `small`, etc. (default `base`) |
 
 The app loads `.env` automatically when started from the `ai-crm-system` directory (see `app/core/config.py`).
@@ -93,15 +93,15 @@ npm run preview   # optional local preview of dist/
 ## End-to-end workflow
 
 1. Start PostgreSQL and set `DATABASE_URL`.
-2. Start the FastAPI app with valid `GEMINI_*` variables.
+2. Start the FastAPI app with valid `GROQ_*` variables.
 3. Start `crm-ui` with `npm run dev`.
 4. Use **Upload** to paste text or upload audio; review extracted fields and mapped CRM ids in the UI.
 
 ## Troubleshooting
 
 - **`Failed to fetch` in the UI** — API not running, wrong port, or browser blocked; confirm `http://127.0.0.1:8000/docs` loads.
-- **503 on ingest** — Missing `GEMINI_API_KEY` or `GEMINI_MODEL`, or database not configured for routes that require a session.
-- **Empty extraction with audio but timestamps present** — Ensure FFmpeg is available; confirm `GEMINI_*` works with a short `POST /ingest/transcript` test; check server logs for Gemini errors.
+- **503 on ingest** — Missing `GROQ_API_KEY` or `GROQ_MODEL`, or database not configured for routes that require a session.
+- **Empty extraction with audio but timestamps present** — Ensure FFmpeg is available; confirm `GROQ_*` works with a short `POST /ingest/transcript` test; check server logs for Groq errors.
 - **Whisper slow or low quality** — Try a larger `WHISPER_MODEL` (uses more RAM) or shorter clips.
 
 ## License

@@ -1,12 +1,12 @@
 """
 Business logic for AI-powered field extraction from transcripts.
 
-Prompt text lives here; Gemini execution and JSON parsing live in `gemini_extraction`.
+Prompt text lives here; Groq execution and JSON parsing live in `groq_extraction`.
 """
 
 from typing import Any
 
-# Full prompt sent to Gemini. Placeholder {transcript} is replaced with the conversation text.
+# Full prompt sent to Groq. Placeholder {transcript} is replaced with the conversation text.
 EXTRACTION_PROMPT_TEMPLATE = """You are an AI system that extracts structured CRM data from sales conversations, emails, or meeting notes.
 
 Extract the following core fields:
@@ -22,7 +22,7 @@ Also populate "custom_fields" with up to 20 additional string key-value pairs us
 Only include keys where you have evidence in the text. Use short snake_case keys.
 If nothing extra applies, return an empty object {{}}.
 
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON in this exact format (top-level keys — do not nest under another object):
 
 {
   "budget": "",
@@ -34,25 +34,41 @@ Return ONLY valid JSON in this exact format:
   "custom_fields": {}
 }
 
+Infer intent (e.g. low / medium / high or a short phrase) from tone and buying signals when numbers are not stated.
+If the dialogue is very short, still set intent when there is any sales or discovery context; leave other fields empty only when unsupported.
+
 Conversation:
 {transcript}"""
 
+# Avoid huge prompts starving JSON output or hitting edge cases with JSON mode.
+TRANSCRIPT_LLM_MAX_CHARS = 120_000
+
 
 def build_extraction_prompt(transcript: str) -> str:
-    """Build the user message for Gemini from the template and transcript."""
-    return EXTRACTION_PROMPT_TEMPLATE.replace("{transcript}", transcript.strip())
+    """Build the user message for Groq from the template and transcript."""
+    t = transcript.strip()
+    if len(t) > TRANSCRIPT_LLM_MAX_CHARS:
+        t = (
+            t[: TRANSCRIPT_LLM_MAX_CHARS // 2]
+            + "\n\n[... middle of transcript omitted for length ...]\n\n"
+            + t[-(TRANSCRIPT_LLM_MAX_CHARS // 2) :]
+        )
+    return EXTRACTION_PROMPT_TEMPLATE.replace("{transcript}", t)
 
 
 def extract_entities(text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Extract CRM-oriented entities via Gemini using `build_extraction_prompt`."""
+    """Extract CRM-oriented entities via Groq using `build_extraction_prompt`."""
     _ = context
-    from app.services.gemini_extraction import execute_gemini_json_extraction
+    from app.services.groq_extraction import execute_groq_json_extraction
 
-    return execute_gemini_json_extraction(build_extraction_prompt(text))
+    return execute_groq_json_extraction(
+        build_extraction_prompt(text),
+        source_transcript=text,
+    )
 
 
 class ExtractionService:
-    """Coordinates extraction from normalized text via Gemini."""
+    """Coordinates extraction from normalized text via Groq."""
 
     def extract_entities(self, text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Extract CRM-oriented entities; `context` reserved for future use."""

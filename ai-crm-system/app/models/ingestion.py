@@ -13,7 +13,11 @@ class TranscriptIngestRequest(BaseModel):
     )
     external_id: str | None = Field(
         default=None,
-        description="Optional client-supplied correlation id",
+        description="Optional client-supplied correlation id (stored as external_interaction_id)",
+    )
+    participants: list[str] | None = Field(
+        default=None,
+        description="Optional participant names/emails (DRD); merged with metadata.participants",
     )
     source_type: Literal["call", "email", "meeting", "sms", "crm_update"] = Field(
         default="call",
@@ -38,7 +42,7 @@ class StructuredTranscript(BaseModel):
 
 
 class ExtractedEntities(BaseModel):
-    """Structured fields extracted from the transcript or email body (Gemini)."""
+    """Structured fields extracted from the transcript or email body (LLM)."""
 
     budget: str = Field(default="", description="Budget signal or range if mentioned")
     intent: str = Field(default="", description="Buyer intent / stage")
@@ -68,7 +72,7 @@ class ExtractedEntities(BaseModel):
 
 
 class TranscriptIngestResponse(BaseModel):
-    """Transcript accepted; includes Gemini extraction, CRM links, and DB row id."""
+    """Transcript accepted; includes LLM extraction, CRM links, and DB row id."""
 
     job_id: str = Field(..., description="Internal job identifier for tracing")
     status: str = Field(default="accepted", description="Ingestion status")
@@ -98,7 +102,7 @@ class AudioIngestResponse(BaseModel):
     account_id: int | None = Field(default=None, description="Linked Account id")
     contact_id: int | None = Field(default=None, description="Linked Contact id")
     deal_id: int | None = Field(default=None, description="Linked Deal id")
-    extracted: ExtractedEntities = Field(..., description="Structured CRM fields from Gemini")
+    extracted: ExtractedEntities = Field(..., description="Structured CRM fields from LLM extraction")
     structured_transcript: StructuredTranscript | None = Field(
         default=None,
         description="Whisper segments with timestamps and inferred speakers",
@@ -124,3 +128,7 @@ class InteractionIngestRequest(BaseModel):
         description="e.g. subject, from, to, message_id, calendar_id, external_record_id",
     )
     external_id: str | None = Field(default=None, description="Idempotency / correlation id")
+    participants: list[str] | None = Field(
+        default=None,
+        description="Optional participant identifiers for unified timeline (DRD)",
+    )
