@@ -99,6 +99,34 @@ class CrmRecord(Base):
     structured_transcript: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     mapping_method: Mapped[str] = mapped_column(String(32), default="rules", server_default="rules")
 
+    # AI Intelligence Layer fields
+    interaction_type: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    deal_score: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    risk_level: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    risk_reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    summary: Mapped[str] = mapped_column(Text, default="", server_default="")
+    tags: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    next_action: Mapped[str] = mapped_column(Text, default="", server_default="")
+    product_version: Mapped[str] = mapped_column(String(256), default="", server_default="")
+    pain_points: Mapped[str] = mapped_column(Text, default="", server_default="")
+    next_step: Mapped[str] = mapped_column(Text, default="", server_default="")
+    urgency_reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    stakeholders: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    mentioned_company: Mapped[str] = mapped_column(String(512), default="", server_default="")
+    procurement_stage: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    use_case: Mapped[str] = mapped_column(Text, default="", server_default="")
+    decision_criteria: Mapped[str] = mapped_column(Text, default="", server_default="")
+    budget_owner: Mapped[str] = mapped_column(String(256), default="", server_default="")
+    implementation_scope: Mapped[str] = mapped_column(String(256), default="", server_default="")
+
     account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
     contact_id: Mapped[int | None] = mapped_column(ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True, index=True)
     deal_id: Mapped[int | None] = mapped_column(ForeignKey("deals.id", ondelete="SET NULL"), nullable=True, index=True)

@@ -74,6 +74,86 @@ class InsightsResponse(BaseModel):
     )
 
 
+class AIIntelligenceItem(BaseModel):
+    id: int
+    interaction_type: str = ""
+    deal_score: int = 0
+    risk_level: str = ""
+    risk_reason: str = ""
+    summary: str = ""
+    tags: list[str] = Field(default_factory=list)
+    next_action: str = ""
+    intent: str = ""
+    budget: int = 0
+    product: str = ""
+
+
+class AIIntelligenceResponse(BaseModel):
+    total_records: int
+    intent_distribution: dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of records per interaction_type",
+    )
+    risk_distribution: dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of records per risk_level",
+    )
+    avg_deal_score: float = 0.0
+    records: list[AIIntelligenceItem]
+
+
+@router.get("/ai-intelligence", response_model=AIIntelligenceResponse)
+def get_ai_intelligence(db: Session = Depends(get_db)) -> AIIntelligenceResponse:
+    """AI Intelligence aggregation: interaction types, risk levels, deal scores."""
+    rows = db.scalars(select(CrmRecord).order_by(CrmRecord.id)).all()
+
+    items: list[AIIntelligenceItem] = []
+    intent_dist: Counter[str] = Counter()
+    risk_dist: Counter[str] = Counter()
+    score_sum = 0
+
+    for row in rows:
+        itype = getattr(row, "interaction_type", "") or ""
+        dscore = getattr(row, "deal_score", 0) or 0
+        rlevel = getattr(row, "risk_level", "") or ""
+        rreason = getattr(row, "risk_reason", "") or ""
+        summary = getattr(row, "summary", "") or ""
+        tags_raw = getattr(row, "tags", None)
+        tags_list = [str(t) for t in tags_raw if t] if isinstance(tags_raw, list) else []
+        naction = getattr(row, "next_action", "") or ""
+
+        if itype:
+            intent_dist[itype] += 1
+        if rlevel:
+            risk_dist[rlevel] += 1
+        score_sum += dscore
+
+        items.append(
+            AIIntelligenceItem(
+                id=row.id,
+                interaction_type=itype,
+                deal_score=dscore,
+                risk_level=rlevel,
+                risk_reason=rreason,
+                summary=summary,
+                tags=tags_list,
+                next_action=naction,
+                intent=row.intent or "",
+                budget=parse_budget_to_int(row.budget),
+                product=row.product or "",
+            )
+        )
+
+    n = len(rows)
+    return AIIntelligenceResponse(
+        total_records=n,
+        intent_distribution=dict(intent_dist),
+        risk_distribution=dict(risk_dist),
+        avg_deal_score=round(score_sum / n, 1) if n else 0.0,
+        records=items,
+    )
+
+
 @router.get("/insights", response_model=InsightsResponse)
 def get_revenue_insights(db: Session = Depends(get_db)) -> InsightsResponse:
     """Aggregate deal-relevant signals for dashboards (FRD 2.5)."""

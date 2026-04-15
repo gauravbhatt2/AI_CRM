@@ -27,6 +27,18 @@ class WhisperNotInstalledError(RuntimeError):
     """Raised when the `whisper` module is missing (broken or incomplete install)."""
 
 
+class FfmpegRequiredError(RuntimeError):
+    """Raised when FFmpeg is not available on PATH (Whisper uses it to decode most audio)."""
+
+
+_FFMPEG_HINT = (
+    "FFmpeg is required for Whisper to decode audio (e.g. MP3). Install FFmpeg and add it "
+    "to your system PATH, then restart the API. On Windows: `winget install Gyan.FFmpeg` "
+    "or `winget install ffmpeg`, or download from https://ffmpeg.org. "
+    "Verify with `ffmpeg -version` in a new terminal."
+)
+
+
 def _get_whisper_model():
     """Lazy-load Whisper model once per process (name from settings)."""
     global _model, _loaded_model_name
@@ -60,7 +72,11 @@ def transcribe_audio_detailed(file_path: str) -> dict:
     Speaker labels are not added here; use `label_segment_speakers` after Groq (optional).
     """
     model = _get_whisper_model()
-    result = model.transcribe(file_path)
+    try:
+        result = model.transcribe(file_path)
+    except FileNotFoundError as e:
+        # Whisper loads audio via FFmpeg; missing ffmpeg on PATH surfaces as WinError 2 / ENOENT.
+        raise FfmpegRequiredError(_FFMPEG_HINT) from e
     text = (result.get("text") or "").strip()
     segments_out: list[dict] = []
     for seg in result.get("segments") or []:

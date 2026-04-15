@@ -19,6 +19,7 @@ from app.models.ingestion import (
     StructuredTranscript,
     TranscriptIngestResponse,
 )
+from app.services.ai_intelligence import run_ai_intelligence
 from app.services.extraction_service import extract_entities
 from app.services.mapping_service import map_entities_to_crm
 
@@ -82,6 +83,11 @@ async def run_transcript_pipeline(
         db,
         source_metadata=meta,
     )
+
+    ai_intel = await asyncio.to_thread(
+        run_ai_intelligence, transcript, extracted.model_dump()
+    )
+
     record = create_crm_record(
         db,
         content=transcript,
@@ -95,6 +101,7 @@ async def run_transcript_pipeline(
         mapping_method=map_method,
         external_interaction_id=ext_key,
         participants=plist,
+        ai_intelligence=ai_intel,
     )
     log_audit_event(
         db,

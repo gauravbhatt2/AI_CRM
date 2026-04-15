@@ -19,7 +19,6 @@ def get_db() -> Generator[Session, None, None]:
     try:
         yield from open_db_session()
     except RuntimeError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="DATABASE_URL is not configured. Set it in the environment or .env file.",
-        ) from exc
+        # Surface the real message (e.g. from app.db.database) instead of a generic line.
+        detail = (str(exc).strip() or "Database session unavailable.")
+        raise HTTPException(status_code=503, detail=detail) from exc

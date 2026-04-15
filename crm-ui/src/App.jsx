@@ -3,6 +3,9 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -16,6 +19,59 @@ const REVENUE_API_URL = "http://127.0.0.1:8000/api/v1/analytics/revenue";
 const INSIGHTS_API_URL = "http://127.0.0.1:8000/api/v1/analytics/insights";
 const TIMELINE_API_URL = "http://127.0.0.1:8000/api/v1/interactions/timeline";
 const CRM_RECORDS_API_URL = "http://127.0.0.1:8000/api/v1/crm/records";
+const HUBSPOT_PUSH_API_BASE = "http://127.0.0.1:8000/api/v1/hubspot/push";
+const AI_INTEL_API_URL = "http://127.0.0.1:8000/api/v1/analytics/ai-intelligence";
+
+const HS_SYNC_STORAGE_KEY = "ai_crm_hubspot_sync_v1";
+const CRM_HUBSPOT_FIELD_KEYS = [
+  "pain_points",
+  "next_step",
+  "procurement_stage",
+  "mentioned_company",
+];
+const CRM_HUBSPOT_FIELD_LABELS = {
+  pain_points: "Pain points",
+  next_step: "Next step",
+  procurement_stage: "Procurement stage",
+  mentioned_company: "Mentioned company",
+};
+
+function readHubspotSyncMap() {
+  try {
+    return JSON.parse(localStorage.getItem(HS_SYNC_STORAGE_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function writeHubspotSyncRecord(recordId, payload) {
+  try {
+    const m = readHubspotSyncMap();
+    m[String(recordId)] = { ...payload, t: Date.now() };
+    localStorage.setItem(HS_SYNC_STORAGE_KEY, JSON.stringify(m));
+  } catch {
+    /* ignore */
+  }
+}
+
+function getCrmHubspotKeyEntries(customFields) {
+  if (!customFields || typeof customFields !== "object") return [];
+  return CRM_HUBSPOT_FIELD_KEYS.map((k) => [
+    k,
+    customFields[k],
+    CRM_HUBSPOT_FIELD_LABELS[k] || k,
+  ]).filter(([, v]) => v != null && String(v).trim() !== "");
+}
+
+function getOtherCustomEntries(customFields) {
+  if (!customFields || typeof customFields !== "object") return [];
+  return Object.entries(customFields).filter(
+    ([k, v]) =>
+      !CRM_HUBSPOT_FIELD_KEYS.includes(k) &&
+      v != null &&
+      String(v).trim() !== "",
+  );
+}
 
 function formatTimestamp(sec) {
   if (sec == null || Number.isNaN(Number(sec))) return "—";
@@ -76,6 +132,101 @@ function formatRecordWhen(iso) {
   }
 }
 
+/** Tooltip: mapping_method is local Account/Contact/Deal linking — not Groq field extraction. */
+const CRM_ENTITY_LINK_HELP =
+  "How this row links to Account / Contact / Deal in this app’s database. " +
+  "This is not the AI extraction method and does not mean transcript fields used a fallback.";
+
+/**
+ * Human label for `mapping_method` (llm | rules | rules_fallback).
+ * `rules_fallback` means an AI CRM-link suggestion existed but was not applied; rules were used.
+ */
+function describeCrmMappingMethod(method) {
+  const m = (method || "").trim().toLowerCase();
+  if (m === "llm") return "Entity links: AI-assisted";
+  if (m === "rules") return "Entity links: rules-based";
+  if (m === "rules_fallback") {
+    return "Entity links: rules (AI link step not applied)";
+  }
+  return (method || "").trim() || "—";
+}
+
+/* ── Design tokens (mirrored in JS for runtime badge colours) ── */
+const INTENT_COLORS = {
+  sales:     { bg: "#dbeafe", color: "#1d4ed8", border: "#93c5fd" },
+  support:   { bg: "#fef9c3", color: "#854d0e", border: "#fde047" },
+  inquiry:   { bg: "#ede9fe", color: "#5b21b6", border: "#c4b5fd" },
+  complaint: { bg: "#fee2e2", color: "#991b1b", border: "#fca5a5" },
+};
+
+const RISK_CONFIG = {
+  high:   { color: "#dc2626", bg: "#fee2e2", icon: "⚠", label: "High"   },
+  medium: { color: "#d97706", bg: "#fef3c7", icon: "◉", label: "Medium" },
+  low:    { color: "#16a34a", bg: "#f0fdf4", icon: "✓", label: "Low"    },
+};
+
+const PIE_COLORS = ["#6366f1", "#f59e0b", "#22c55e", "#ef4444", "#3b82f6", "#ec4899"];
+
+/* ── Shared mini-components ─────────────────────────────────────────── */
+
+function IntentBadge({ type }) {
+  const c = INTENT_COLORS[type] || { bg: "#f1f5f9", color: "#475569", border: "#cbd5e1" };
+  return (
+    <span className="crm-ai-badge" style={{ background: c.bg, color: c.color, borderColor: c.border }}>
+      {type || "—"}
+    </span>
+  );
+}
+
+function RiskIndicator({ level }) {
+  const c = RISK_CONFIG[level] || { color: "#64748b", bg: "#f1f5f9", icon: "—", label: "—" };
+  return (
+    <span className="crm-ai-risk" style={{ background: c.bg, color: c.color }}>
+      <span className="crm-ai-risk-icon" aria-hidden="true">{c.icon}</span>
+      {c.label}
+    </span>
+  );
+}
+
+function DealScoreBar({ score }) {
+  const pct = Math.max(0, Math.min(100, Number(score) || 0));
+  const color = pct >= 70 ? "#22c55e" : pct >= 40 ? "#f59e0b" : "#ef4444";
+  return (
+    <div className="crm-ai-score-wrap">
+      <div className="crm-ai-score-bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+        <div className="crm-ai-score-fill" style={{ width: `${pct}%`, background: color }} />
+      </div>
+      <span className="crm-ai-score-val">{pct}</span>
+    </div>
+  );
+}
+
+function Spinner({ size = 14, color = "rgba(255,255,255,.35)", topColor = "#fff" }) {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: "inline-block",
+        width: size, height: size,
+        border: `2px solid ${color}`,
+        borderTopColor: topColor,
+        borderRadius: "50%",
+        animation: "crm-spin 0.65s linear infinite",
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
+function EmptyState({ text }) {
+  return (
+    <div style={{ textAlign: "center", padding: "40px 20px", color: "var(--muted)" }}>
+      <div style={{ fontSize: "2rem", marginBottom: 10 }}>🗂</div>
+      <p style={{ margin: 0, fontSize: "0.9rem", fontWeight: 600 }}>{text}</p>
+    </div>
+  );
+}
+
 function App() {
   const [inputMode, setInputMode] = useState("audio");
   const [textSource, setTextSource] = useState("call");
@@ -98,6 +249,9 @@ function App() {
   const [recordsQuery, setRecordsQuery] = useState("");
   const [recordsSourceFilter, setRecordsSourceFilter] = useState("all");
   const [recordsDeleting, setRecordsDeleting] = useState(false);
+  const [syncingByRecord, setSyncingByRecord] = useState({});
+  const [hubspotNoticeByRecord, setHubspotNoticeByRecord] = useState({});
+  const [hubspotSyncMap, setHubspotSyncMap] = useState({});
 
   const [insightsData, setInsightsData] = useState(null);
   const [insightsLoading, setInsightsLoading] = useState(true);
@@ -106,6 +260,10 @@ function App() {
   const [timelineItems, setTimelineItems] = useState(null);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState(null);
+
+  const [aiIntelData, setAiIntelData] = useState(null);
+  const [aiIntelLoading, setAiIntelLoading] = useState(true);
+  const [aiIntelError, setAiIntelError] = useState(null);
 
   const [activeSection, setActiveSection] = useState("dashboard");
 
@@ -167,17 +325,20 @@ function App() {
 
   const refreshDashboard = useCallback(async () => {
     try {
-      const [revRes, crmRes, insRes] = await Promise.all([
+      const [revRes, crmRes, insRes, aiRes] = await Promise.all([
         fetch(REVENUE_API_URL, { mode: "cors", cache: "no-store" }),
         fetch(CRM_RECORDS_API_URL, { mode: "cors", cache: "no-store" }),
         fetch(INSIGHTS_API_URL, { mode: "cors", cache: "no-store" }),
+        fetch(AI_INTEL_API_URL, { mode: "cors", cache: "no-store" }),
       ]);
       const revText = await revRes.text();
       const crmText = await crmRes.text();
       const insText = await insRes.text();
+      const aiText = await aiRes.text();
       let revData = {};
       let crmData = [];
       let insData = {};
+      let aiData = {};
       try {
         revData = revText ? JSON.parse(revText) : {};
       } catch {
@@ -190,6 +351,11 @@ function App() {
       }
       try {
         insData = insText ? JSON.parse(insText) : {};
+      } catch {
+        /* ignore */
+      }
+      try {
+        aiData = aiText ? JSON.parse(aiText) : {};
       } catch {
         /* ignore */
       }
@@ -224,12 +390,22 @@ function App() {
         );
         setInsightsData(null);
       }
+      if (aiRes.ok) {
+        setAiIntelData(aiData);
+        setAiIntelError(null);
+      } else {
+        setAiIntelError(
+          friendlyFetchError(parseApiError(aiText, aiRes.status)),
+        );
+        setAiIntelData(null);
+      }
     } catch (err) {
       const raw =
         err instanceof Error ? err.message : "Failed to refresh dashboard.";
       setRevenueError(friendlyFetchError(raw));
       setCrmRecordsError(friendlyFetchError(raw));
       setInsightsError(friendlyFetchError(raw));
+      setAiIntelError(friendlyFetchError(raw));
     }
   }, []);
 
@@ -263,6 +439,68 @@ function App() {
     }
   };
 
+  const pushToHubspot = async (recordId) => {
+    setSyncingByRecord((prev) => ({ ...prev, [recordId]: true }));
+    setHubspotNoticeByRecord((prev) => ({ ...prev, [recordId]: null }));
+    try {
+      const res = await fetch(`${HUBSPOT_PUSH_API_BASE}/${recordId}`, {
+        method: "POST",
+        mode: "cors",
+        cache: "no-store",
+      });
+      const text = await res.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = {};
+      }
+      if (!res.ok) {
+        throw new Error(parseApiError(text, res.status));
+      }
+      const dealId = data.hubspot_deal_id || data.hubspot?.id;
+      const openUrl = data.deal_record_url;
+      const parts = ["Synced to HubSpot ✅"];
+      if (dealId) parts.push(`Deal #${dealId}`);
+      if (data.hubspot_contact_id) parts.push(`Contact linked`);
+      if (data.hubspot_company_id) parts.push(`Company linked`);
+      if (data.hubspot_note_id) parts.push(`Transcript note added`);
+      const msg = parts.join(" · ");
+      writeHubspotSyncRecord(recordId, {
+        dealId: dealId || null,
+        url: openUrl || null,
+      });
+      setHubspotSyncMap((prev) => ({
+        ...prev,
+        [String(recordId)]: {
+          dealId: dealId || null,
+          url: openUrl || null,
+          t: Date.now(),
+        },
+      }));
+      setHubspotNoticeByRecord((prev) => ({
+        ...prev,
+        [recordId]: {
+          type: "success",
+          message: msg,
+          linkUrl: openUrl || null,
+        },
+      }));
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : "HubSpot sync failed.";
+      setHubspotNoticeByRecord((prev) => ({
+        ...prev,
+        [recordId]: { type: "error", message: friendlyFetchError(raw) },
+      }));
+    } finally {
+      setSyncingByRecord((prev) => ({ ...prev, [recordId]: false }));
+    }
+  };
+
+  useEffect(() => {
+    setHubspotSyncMap(readHubspotSyncMap());
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -270,9 +508,11 @@ function App() {
       setRevenueLoading(true);
       setCrmRecordsLoading(true);
       setInsightsLoading(true);
+      setAiIntelLoading(true);
       setRevenueError(null);
       setCrmRecordsError(null);
       setInsightsError(null);
+      setAiIntelError(null);
       try {
         await refreshDashboard();
       } finally {
@@ -280,6 +520,7 @@ function App() {
           setRevenueLoading(false);
           setCrmRecordsLoading(false);
           setInsightsLoading(false);
+          setAiIntelLoading(false);
         }
       }
     }
@@ -452,12 +693,8 @@ function App() {
   /** Show em dash when field is missing, null, or whitespace-only (empty string is not nullish). */
   const showField = (v) =>
     v != null && String(v).trim() !== "" ? String(v).trim() : "—";
-  const customEntries =
-    ex?.custom_fields && typeof ex.custom_fields === "object"
-      ? Object.entries(ex.custom_fields).filter(
-          ([, v]) => v != null && String(v).trim() !== "",
-        )
-      : [];
+  const hubspotKeyEntries = getCrmHubspotKeyEntries(ex?.custom_fields);
+  const customEntriesOther = getOtherCustomEntries(ex?.custom_fields);
 
   function renderUploadError() {
     if (!error) return null;
@@ -471,12 +708,13 @@ function App() {
 
   function renderUploadResults() {
     if (!result || loading) return null;
+
     const transcriptBlock =
       result.structured_transcript?.segments?.length > 0 ? (
         <div className="crm-card">
           <div className="crm-section-title-row">
-            <p className="crm-section-title">Transcript</p>
-            <span className="crm-meta-pill" style={{ marginBottom: 0 }}>
+            <span className="crm-section-title" style={{ marginBottom: 0 }}>Transcript</span>
+            <span className="crm-meta-pill">
               {result.structured_transcript.segments.length} segments · speakers
             </span>
           </div>
@@ -484,12 +722,8 @@ function App() {
             {result.structured_transcript.segments.map((seg, i) => (
               <div key={i} className="crm-seg">
                 <div className="crm-seg-head">
-                  <span className="crm-seg-time">
-                    {formatTimestamp(seg.start)} – {formatTimestamp(seg.end)}
-                  </span>
-                  {seg.speaker ? (
-                    <span className="crm-seg-sp">{seg.speaker}</span>
-                  ) : null}
+                  <span className="crm-seg-time">{formatTimestamp(seg.start)} – {formatTimestamp(seg.end)}</span>
+                  {seg.speaker && <span className="crm-seg-sp">{seg.speaker}</span>}
                 </div>
                 <p className="crm-seg-body">{seg.text}</p>
               </div>
@@ -498,20 +732,20 @@ function App() {
         </div>
       ) : (
         <div className="crm-card">
-          <p className="crm-section-title">Transcript</p>
+          <span className="crm-section-title">Transcript</span>
           <div className="crm-transcript">{result.transcript || "—"}</div>
         </div>
       );
 
     return (
       <>
+        {/* ── Hero result card ── */}
         <div className="crm-card crm-card--elevated">
           <div className="crm-result-hero">
             <div className="crm-result-hero-main">
-              <p className="crm-result-hero-title">Ingestion complete</p>
+              <p className="crm-result-hero-title">✅ Ingestion complete</p>
               <p className="crm-result-hero-sub">
-                Structured fields and CRM links are saved. Reference this job
-                when auditing.
+                AI extraction, deal scoring, and risk analysis saved to CRM.
               </p>
             </div>
             <div className="crm-result-hero-ids">
@@ -521,7 +755,7 @@ function App() {
               </span>
               <span className="crm-id-chip">
                 <span className="crm-id-chip-lbl">Record</span>
-                {`#${result.record_id ?? "—"}`}
+                #{result.record_id ?? "—"}
               </span>
             </div>
           </div>
@@ -541,62 +775,54 @@ function App() {
           </div>
         </div>
 
+        {/* ── Entity mapping ── */}
         <div className="crm-card">
           <div className="crm-section-title-row">
-            <p className="crm-section-title">Entity mapping</p>
-            <span className="crm-meta-pill" style={{ marginBottom: 0 }}>
-              {result.mapping_method || "—"} · {result.source_type || "—"}
+            <span className="crm-section-title" style={{ marginBottom: 0 }}>Entity mapping</span>
+            <span className="crm-meta-pill" title={CRM_ENTITY_LINK_HELP}>
+              {describeCrmMappingMethod(result.mapping_method)} · {result.source_type || "—"}
             </span>
           </div>
           <div className="crm-mapping">
-            <div className="crm-map-item">
-              <div className="crm-map-label">Account</div>
-              <div className="crm-map-id">{result.account_id ?? "—"}</div>
-            </div>
-            <div className="crm-map-item">
-              <div className="crm-map-label">Contact</div>
-              <div className="crm-map-id">{result.contact_id ?? "—"}</div>
-            </div>
-            <div className="crm-map-item">
-              <div className="crm-map-label">Deal</div>
-              <div className="crm-map-id">{result.deal_id ?? "—"}</div>
-            </div>
+            <div className="crm-map-item"><div className="crm-map-label">Account</div><div className="crm-map-id">{result.account_id ?? "—"}</div></div>
+            <div className="crm-map-item"><div className="crm-map-label">Contact</div><div className="crm-map-id">{result.contact_id ?? "—"}</div></div>
+            <div className="crm-map-item"><div className="crm-map-label">Deal</div><div className="crm-map-id">{result.deal_id ?? "—"}</div></div>
           </div>
         </div>
 
+        {/* ── Extraction fields ── */}
         <div className="crm-card">
-          <p className="crm-section-title">Full extraction</p>
+          <span className="crm-section-title">Extracted fields</span>
           <div className="crm-grid">
-            <div className="crm-field">
-              <div className="crm-field-label">Industry</div>
-              <div className="crm-field-value">{showField(ex?.industry)}</div>
-            </div>
-            <div className="crm-field">
-              <div className="crm-field-label">Product</div>
-              <div className="crm-field-value">{showField(ex?.product)}</div>
-            </div>
+            <div className="crm-field"><div className="crm-field-label">Industry</div><div className="crm-field-value">{showField(ex?.industry)}</div></div>
+            <div className="crm-field"><div className="crm-field-label">Product</div><div className="crm-field-value">{showField(ex?.product)}</div></div>
             <div className="crm-field" style={{ gridColumn: "1 / -1" }}>
               <div className="crm-field-label">Competitors</div>
               <div className="crm-field-value">
-                {Array.isArray(ex?.competitors) && ex.competitors.length > 0 ? (
-                  <ul className="crm-list">
-                    {ex.competitors.map((c, i) => (
-                      <li key={i}>{c}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  "—"
-                )}
+                {Array.isArray(ex?.competitors) && ex.competitors.length > 0
+                  ? <ul className="crm-list">{ex.competitors.map((c, i) => <li key={i}>{c}</li>)}</ul>
+                  : "—"}
               </div>
             </div>
           </div>
-          {customEntries.length > 0 ? (
+          {hubspotKeyEntries.length > 0 && (
             <>
-              <p className="crm-section-title" style={{ marginTop: "1.25rem" }}>
-                Custom fields ({customEntries.length})
-              </p>
+              <span className="crm-section-title" style={{ marginTop: "1.25rem", display: "block" }}>CRM highlights</span>
               <div className="crm-kv-grid">
-                {customEntries.map(([k, v]) => (
+                {hubspotKeyEntries.map(([k, v, label]) => (
+                  <div key={k} className="crm-kv crm-kv--highlight">
+                    <div className="crm-kv-k">{label}</div>
+                    <div className="crm-kv-v">{String(v)}</div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {customEntriesOther.length > 0 && (
+            <>
+              <span className="crm-section-title" style={{ marginTop: "1.25rem", display: "block" }}>Other fields ({customEntriesOther.length})</span>
+              <div className="crm-kv-grid">
+                {customEntriesOther.map(([k, v]) => (
                   <div key={k} className="crm-kv">
                     <div className="crm-kv-k">{k}</div>
                     <div className="crm-kv-v">{String(v)}</div>
@@ -604,7 +830,7 @@ function App() {
                 ))}
               </div>
             </>
-          ) : null}
+          )}
         </div>
 
         {transcriptBlock}
@@ -622,32 +848,34 @@ function App() {
       <div className="crm-layout">
         <aside className="crm-sidebar" aria-label="Application navigation">
           <div className="crm-sidebar-brand">
-            <span className="crm-sidebar-brand-text">AI CRM</span>
-            <span className="crm-sidebar-tagline">Revenue intelligence</span>
+            <span className="crm-sidebar-brand-mark" aria-hidden="true">AI</span>
+            <span>
+              <span className="crm-sidebar-brand-text">AI CRM</span>
+              <span className="crm-sidebar-tagline">Revenue intelligence</span>
+            </span>
           </div>
           <nav className="crm-nav">
             {[
-              ["dashboard", "Dashboard"],
-              ["timeline", "Timeline"],
-              ["upload", "Upload"],
-              ["analytics", "Analytics"],
-              ["records", "CRM Records"],
-            ].map(([id, label]) => (
+              ["dashboard",    "🏠", "Dashboard"],
+              ["intelligence", "🧠", "AI Intelligence"],
+              ["timeline",     "⏱",  "Timeline"],
+              ["upload",       "⬆",  "Upload"],
+              ["analytics",    "📊", "Analytics"],
+              ["records",      "📋", "CRM Records"],
+            ].map(([id, icon, label]) => (
               <button
                 key={id}
                 type="button"
-                className={
-                  "crm-nav-item" +
-                  (activeSection === id ? " crm-nav-item--active" : "")
-                }
+                className={"crm-nav-item" + (activeSection === id ? " crm-nav-item--active" : "")}
                 aria-current={activeSection === id ? "page" : undefined}
                 onClick={() => setActiveSection(id)}
               >
+                <span className="crm-nav-icon" aria-hidden="true">{icon}</span>
                 {label}
               </button>
             ))}
           </nav>
-          <div className="crm-sidebar-footer">Interaction mining</div>
+          <div className="crm-sidebar-footer">Interaction mining · v2</div>
         </aside>
 
         <main className="crm-main">
@@ -656,154 +884,227 @@ function App() {
               <>
                 <div className="crm-page-head">
                   <h1 className="crm-page-title">Dashboard</h1>
-                  <p className="crm-page-desc">
-                    Snapshot of ingested interactions and parsed revenue
-                    signals.
-                  </p>
+                  <p className="crm-page-desc">Live snapshot of ingested interactions and AI-parsed revenue signals.</p>
                 </div>
-                <div className="crm-card crm-dash-panel">
-                  <p className="crm-section-title">At a glance</p>
-                  <div className="crm-dash-stats">
-                    <div className="crm-dash-stat">
-                      <div className="crm-dash-stat-label">Total records</div>
-                      <div className="crm-dash-stat-value">
-                        {revenueLoading
-                          ? "…"
-                          : (revenueData?.total_records ?? 0).toLocaleString()}
-                      </div>
-                    </div>
-                    <div className="crm-dash-stat">
-                      <div className="crm-dash-stat-label">
-                        Combined budget (parsed)
-                      </div>
-                      <div className="crm-dash-stat-value">
-                        {revenueLoading
-                          ? "…"
-                          : Number(
-                              revenueData?.total_budget ?? 0,
-                            ).toLocaleString()}
-                      </div>
-                    </div>
-                    <div className="crm-dash-stat">
-                      <div className="crm-dash-stat-label">Rows in CRM</div>
-                      <div className="crm-dash-stat-value">
-                        {crmRecordsLoading
-                          ? "…"
-                          : (crmRecords?.length ?? 0).toLocaleString()}
-                      </div>
+
+                {/* ── Stats row ── */}
+                <div className="crm-ai-kpi-row">
+                  <div className="crm-ai-kpi crm-ai-kpi--blue">
+                    <div className="crm-ai-kpi-label">Total records</div>
+                    <div className="crm-ai-kpi-value">
+                      {revenueLoading ? <Spinner size={20} color="#bfdbfe" topColor="#3b82f6" /> : (revenueData?.total_records ?? 0).toLocaleString()}
                     </div>
                   </div>
-                  <div className="crm-dash-hint">
-                    <strong>Tip:</strong> Use <strong>Upload</strong> to ingest
-                    audio or text, <strong>Timeline</strong> for unified
-                    history, <strong>Analytics</strong> for charts, and{" "}
-                    <strong>CRM Records</strong> to browse extracted
-                    interactions.
+                  <div className="crm-ai-kpi crm-ai-kpi--green">
+                    <div className="crm-ai-kpi-label">Combined budget</div>
+                    <div className="crm-ai-kpi-value">
+                      {revenueLoading ? "…" : Number(revenueData?.total_budget ?? 0).toLocaleString()}
+                    </div>
                   </div>
-                  <div className="crm-card crm-dash-panel" style={{ marginTop: "1rem" }}>
-                    <p className="crm-section-title">Interaction insights</p>
-                    {insightsLoading && (
-                      <p className="crm-revenue-loading" role="status">
-                        Loading insights…
-                      </p>
-                    )}
-                    {!insightsLoading && insightsError && (
-                      <p className="crm-revenue-err" role="alert">
-                        {insightsError}
-                      </p>
-                    )}
-                    {!insightsLoading && !insightsError && insightsData && (
-                      <>
-                        <div className="crm-dash-stats">
-                          <div className="crm-dash-stat">
-                            <div className="crm-dash-stat-label">
-                              Avg budget (parsed)
-                            </div>
-                            <div className="crm-dash-stat-value">
-                              {Number(
-                                insightsData.avg_budget ?? 0,
-                              ).toLocaleString(undefined, {
-                                maximumFractionDigits: 0,
-                              })}
-                            </div>
-                          </div>
-                          <div className="crm-dash-stat">
-                            <div className="crm-dash-stat-label">
-                              Intent · strong signals
-                            </div>
-                            <div className="crm-dash-stat-value">
-                              {(
-                                insightsData.intent_keywords_high ?? 0
-                              ).toLocaleString()}
-                            </div>
-                          </div>
-                          <div className="crm-dash-stat">
-                            <div className="crm-dash-stat-label">
-                              Intent · exploratory
-                            </div>
-                            <div className="crm-dash-stat-value">
-                              {(
-                                insightsData.intent_keywords_low ?? 0
-                              ).toLocaleString()}
-                            </div>
+                  <div className="crm-ai-kpi crm-ai-kpi--orange">
+                    <div className="crm-ai-kpi-label">Strong intent</div>
+                    <div className="crm-ai-kpi-value">
+                      {insightsLoading ? "…" : (insightsData?.intent_keywords_high ?? 0).toLocaleString()}
+                    </div>
+                  </div>
+                  <div className="crm-ai-kpi crm-ai-kpi--purple">
+                    <div className="crm-ai-kpi-label">Avg deal score</div>
+                    <div className="crm-ai-kpi-value">
+                      {aiIntelLoading ? "…" : (aiIntelData?.avg_deal_score ?? 0)}
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Insights card ── */}
+                <div className="crm-card">
+                  <span className="crm-section-title">Interaction insights</span>
+                  {insightsLoading && <p className="crm-revenue-loading" role="status">Loading…</p>}
+                  {!insightsLoading && insightsError && <p className="crm-revenue-err" role="alert">{insightsError}</p>}
+                  {!insightsLoading && !insightsError && insightsData && (
+                    <>
+                      <div className="crm-dash-stats">
+                        <div className="crm-dash-stat">
+                          <div className="crm-dash-stat-label">Avg budget</div>
+                          <div className="crm-dash-stat-value">
+                            {Number(insightsData.avg_budget ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
                           </div>
                         </div>
-                        {insightsData.by_source_type &&
-                        typeof insightsData.by_source_type === "object" &&
-                        Object.keys(insightsData.by_source_type).length > 0 ? (
-                          <div className="crm-insights-sources">
-                            <span className="crm-record-tags-lbl">
-                              By channel
-                            </span>
-                            <div className="crm-record-tag-row">
-                              {Object.entries(insightsData.by_source_type).map(
-                                ([src, n]) => (
-                                  <span
-                                    key={src}
-                                    className="crm-record-tag"
-                                    title={`${n} record(s)`}
-                                  >
-                                    {src}: {n}
-                                  </span>
-                                ),
-                              )}
-                            </div>
+                        <div className="crm-dash-stat">
+                          <div className="crm-dash-stat-label">Strong signals</div>
+                          <div className="crm-dash-stat-value">{(insightsData.intent_keywords_high ?? 0).toLocaleString()}</div>
+                        </div>
+                        <div className="crm-dash-stat">
+                          <div className="crm-dash-stat-label">Exploratory</div>
+                          <div className="crm-dash-stat-value">{(insightsData.intent_keywords_low ?? 0).toLocaleString()}</div>
+                        </div>
+                      </div>
+                      {insightsData.by_source_type && Object.keys(insightsData.by_source_type).length > 0 && (
+                        <div className="crm-insights-sources">
+                          <span className="crm-record-tags-lbl">By channel</span>
+                          <div className="crm-record-tag-row" style={{ marginTop: 6 }}>
+                            {Object.entries(insightsData.by_source_type).map(([src, n]) => (
+                              <span key={src} className="crm-record-tag" title={`${n} record(s)`}>{src}: {n}</span>
+                            ))}
                           </div>
-                        ) : null}
-                      </>
-                    )}
-                  </div>
+                        </div>
+                      )}
+                    </>
+                  )}
                   <div className="crm-dash-actions">
-                    <button
-                      type="button"
-                      className="crm-dash-action"
-                      onClick={() => setActiveSection("upload")}
-                    >
-                      New upload
-                    </button>
-                    <button
-                      type="button"
-                      className="crm-dash-action"
-                      onClick={() => setActiveSection("timeline")}
-                    >
-                      Open timeline
-                    </button>
-                    <button
-                      type="button"
-                      className="crm-dash-action"
-                      onClick={() => setActiveSection("analytics")}
-                    >
-                      View analytics
-                    </button>
-                    <button
-                      type="button"
-                      className="crm-dash-action"
-                      onClick={() => setActiveSection("records")}
-                    >
-                      Browse records
-                    </button>
+                    {[
+                      ["upload",       "⬆ New upload"],
+                      ["timeline",     "⏱ Timeline"],
+                      ["analytics",    "📊 Analytics"],
+                      ["records",      "📋 Records"],
+                      ["intelligence", "🧠 AI Intelligence"],
+                    ].map(([id, label]) => (
+                      <button key={id} type="button"
+                        className={"crm-dash-action" + (id === "intelligence" ? " crm-dash-action--ai" : "")}
+                        onClick={() => setActiveSection(id)}
+                      >
+                        {label}
+                      </button>
+                    ))}
                   </div>
                 </div>
+              </>
+            )}
+
+            {activeSection === "intelligence" && (
+              <>
+                <div className="crm-page-head">
+                  <h1 className="crm-page-title">🧠 AI Intelligence</h1>
+                  <p className="crm-page-desc">Classification, deal scoring, risk detection, and next-action suggestions — automatically derived from every ingested interaction.</p>
+                </div>
+
+                {aiIntelLoading && (
+                  <div className="crm-card crm-ai-loading-card">
+                    <div className="crm-ai-loading">
+                      <span className="crm-ai-loading-spinner" />
+                      Analyzing interactions with AI…
+                    </div>
+                  </div>
+                )}
+
+                {!aiIntelLoading && aiIntelError && <p className="crm-revenue-err" role="alert">{aiIntelError}</p>}
+
+                {!aiIntelLoading && !aiIntelError && aiIntelData && (
+                  <>
+                    {/* KPI row */}
+                    <div className="crm-ai-kpi-row">
+                      <div className="crm-ai-kpi crm-ai-kpi--blue">
+                        <div className="crm-ai-kpi-label">Total records</div>
+                        <div className="crm-ai-kpi-value">{(aiIntelData.total_records ?? 0).toLocaleString()}</div>
+                      </div>
+                      <div className="crm-ai-kpi crm-ai-kpi--green">
+                        <div className="crm-ai-kpi-label">Avg deal score</div>
+                        <div className="crm-ai-kpi-value">{aiIntelData.avg_deal_score ?? 0}</div>
+                      </div>
+                      <div className="crm-ai-kpi crm-ai-kpi--orange">
+                        <div className="crm-ai-kpi-label">High risk</div>
+                        <div className="crm-ai-kpi-value">{aiIntelData.risk_distribution?.high ?? 0}</div>
+                      </div>
+                      <div className="crm-ai-kpi crm-ai-kpi--purple">
+                        <div className="crm-ai-kpi-label">Sales interactions</div>
+                        <div className="crm-ai-kpi-value">{aiIntelData.intent_distribution?.sales ?? 0}</div>
+                      </div>
+                    </div>
+
+                    {/* Charts — pie charts side by side */}
+                    <div className="crm-ai-charts-row">
+                      <div className="crm-card crm-ai-chart-card">
+                        <span className="crm-section-title">Interaction type</span>
+                        {aiIntelData.intent_distribution && Object.keys(aiIntelData.intent_distribution).length > 0 ? (
+                          <div className="crm-ai-pie-wrap">
+                            <ResponsiveContainer width="100%" height={260}>
+                              <PieChart>
+                                <Pie
+                                  data={Object.entries(aiIntelData.intent_distribution).map(([name, value]) => ({ name, value }))}
+                                  cx="50%" cy="50%"
+                                  innerRadius={55} outerRadius={95}
+                                  paddingAngle={3} dataKey="value"
+                                  label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                                  labelLine={false}
+                                >
+                                  {Object.keys(aiIntelData.intent_distribution).map((_, i) => (
+                                    <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                                  ))}
+                                </Pie>
+                                <Tooltip contentStyle={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 12, fontSize: 13 }} />
+                              </PieChart>
+                            </ResponsiveContainer>
+                          </div>
+                        ) : <EmptyState text="No interaction data yet." />}
+                      </div>
+
+                      <div className="crm-card crm-ai-chart-card">
+                        <span className="crm-section-title">Risk distribution</span>
+                        {aiIntelData.risk_distribution && Object.keys(aiIntelData.risk_distribution).length > 0 ? (
+                          <div className="crm-ai-pie-wrap">
+                            <ResponsiveContainer width="100%" height={260}>
+                              <PieChart>
+                                <Pie
+                                  data={Object.entries(aiIntelData.risk_distribution).map(([name, value]) => ({ name, value }))}
+                                  cx="50%" cy="50%"
+                                  innerRadius={55} outerRadius={95}
+                                  paddingAngle={3} dataKey="value"
+                                  label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                                  labelLine={false}
+                                >
+                                  {Object.entries(aiIntelData.risk_distribution).map(([key], i) => (
+                                    <Cell key={i} fill={key === "high" ? "#ef4444" : key === "medium" ? "#f59e0b" : "#22c55e"} />
+                                  ))}
+                                </Pie>
+                                <Tooltip contentStyle={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 12, fontSize: 13 }} />
+                              </PieChart>
+                            </ResponsiveContainer>
+                          </div>
+                        ) : <EmptyState text="No risk data yet." />}
+                      </div>
+                    </div>
+
+                    {/* Intelligence table */}
+                    {Array.isArray(aiIntelData.records) && aiIntelData.records.length > 0 ? (
+                      <div className="crm-card">
+                        <span className="crm-section-title">Intelligence overview</span>
+                        <div className="crm-table-wrap crm-ai-table-wrap">
+                          <table className="crm-table crm-ai-table">
+                            <thead>
+                              <tr>
+                                <th>ID</th>
+                                <th>Intent type</th>
+                                <th style={{ minWidth: 140 }}>Deal score</th>
+                                <th>Risk</th>
+                                <th>Next action</th>
+                                <th>Tags</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {aiIntelData.records.map((rec) => (
+                                <tr key={rec.id} className="crm-ai-table-row">
+                                  <td className="crm-td-mono">#{rec.id}</td>
+                                  <td><IntentBadge type={rec.interaction_type} /></td>
+                                  <td><DealScoreBar score={rec.deal_score} /></td>
+                                  <td><RiskIndicator level={rec.risk_level} /></td>
+                                  <td className="crm-ai-action-cell">{rec.next_action || "—"}</td>
+                                  <td>
+                                    <div className="crm-ai-tag-row">
+                                      {Array.isArray(rec.tags) && rec.tags.length > 0
+                                        ? rec.tags.slice(0, 4).map((t, i) => <span key={i} className="crm-ai-tag">{t}</span>)
+                                        : <span style={{ color: "var(--muted-2)", fontSize: "0.8rem" }}>—</span>}
+                                    </div>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="crm-card"><EmptyState text="No records processed yet. Upload a transcript to generate AI intelligence." /></div>
+                    )}
+                  </>
+                )}
               </>
             )}
 
@@ -819,9 +1120,12 @@ function App() {
 
                 <div className="crm-card crm-records-card">
                   {timelineLoading && (
-                    <p className="crm-records-loading" role="status">
-                      Loading timeline…
-                    </p>
+                    <div className="crm-ai-loading-card">
+                      <div className="crm-ai-loading">
+                        <span className="crm-ai-loading-spinner" />
+                        Loading timeline…
+                      </div>
+                    </div>
                   )}
                   {!timelineLoading && timelineError && (
                     <p className="crm-records-err" role="alert">
@@ -991,13 +1295,8 @@ function App() {
                           onClick={handleProcess}
                           disabled={loading || !file}
                         >
-                          {loading && (
-                            <span
-                              className="crm-btn-spinner"
-                              aria-hidden="true"
-                            />
-                          )}
-                          {loading ? "Processing..." : "Process Audio"}
+                          {loading && <Spinner />}
+                          {loading ? "Processing…" : "Process Audio"}
                         </button>
                       </div>
                       {file && (
@@ -1067,13 +1366,8 @@ function App() {
                           onClick={handleProcess}
                           disabled={loading || !transcriptText.trim()}
                         >
-                          {loading && (
-                            <span
-                              className="crm-btn-spinner"
-                              aria-hidden="true"
-                            />
-                          )}
-                          {loading ? "Processing..." : "Process Text"}
+                          {loading && <Spinner />}
+                          {loading ? "Processing…" : "Process Text"}
                         </button>
                       </div>
                     </div>
@@ -1100,9 +1394,12 @@ function App() {
                   </div>
 
                   {revenueLoading && (
-                    <p className="crm-revenue-loading" role="status">
-                      Loading analytics...
-                    </p>
+                    <div className="crm-ai-loading-card">
+                      <div className="crm-ai-loading">
+                        <span className="crm-ai-loading-spinner" />
+                        Loading analytics…
+                      </div>
+                    </div>
                   )}
 
                   {!revenueLoading && revenueError && (
@@ -1114,7 +1411,7 @@ function App() {
                   {!revenueLoading && !revenueError && revenueData && (
                     <>
                       {revenueData.total_records === 0 ||
-                      !revenueData.records?.length ? (
+                        !revenueData.records?.length ? (
                         <p className="crm-revenue-empty">
                           No CRM records yet. Open <strong>Upload</strong> to
                           ingest transcripts or audio and populate revenue data.
@@ -1388,26 +1685,21 @@ function App() {
                   </div>
 
                   {crmRecordsLoading && (
-                    <p className="crm-records-loading" role="status">
-                      Loading records...
-                    </p>
+                    <div className="crm-ai-loading-card">
+                      <div className="crm-ai-loading">
+                        <span className="crm-ai-loading-spinner" />
+                        Loading records…
+                      </div>
+                    </div>
                   )}
 
                   {!crmRecordsLoading && crmRecordsError && (
-                    <p className="crm-records-err" role="alert">
-                      {crmRecordsError}
-                    </p>
+                    <p className="crm-records-err" role="alert">{crmRecordsError}</p>
                   )}
 
-                  {!crmRecordsLoading &&
-                    !crmRecordsError &&
-                    crmRecords &&
-                    crmRecords.length === 0 && (
-                      <p className="crm-records-empty">
-                        No CRM records yet. Ingest a transcript or audio from{" "}
-                        <strong>Upload</strong> to see interactions here.
-                      </p>
-                    )}
+                  {!crmRecordsLoading && !crmRecordsError && crmRecords && crmRecords.length === 0 && (
+                    <EmptyState text="No CRM records yet. Use Upload to ingest a transcript or audio." />
+                  )}
 
                   {!crmRecordsLoading &&
                     !crmRecordsError &&
@@ -1435,17 +1727,18 @@ function App() {
                       <ul className="crm-record-list">
                         {filteredCrmRecords.map((row) => {
                           const when = formatRecordWhen(row.created_at);
-                          const customEntries =
-                            row.custom_fields &&
-                            typeof row.custom_fields === "object"
-                              ? Object.entries(row.custom_fields).filter(
-                                  ([, v]) =>
-                                    v != null && String(v).trim() !== "",
-                                )
-                              : [];
+                          const hubspotKeyEntries = getCrmHubspotKeyEntries(
+                            row.custom_fields,
+                          );
+                          const customEntriesOther = getOtherCustomEntries(
+                            row.custom_fields,
+                          );
+                          const hsSynced = Boolean(
+                            hubspotSyncMap[String(row.id)],
+                          );
                           return (
                             <li key={row.id}>
-                              <details className="crm-record-card">
+                              <details className="crm-record-card crm-record-card--enhanced">
                                 <summary className="crm-record-summary">
                                   <span className="crm-record-summary-top">
                                     <span className="crm-record-id">
@@ -1454,12 +1747,24 @@ function App() {
                                     <span className="crm-meta-pill">
                                       {row.source_type || "—"}
                                     </span>
+                                    {row.interaction_type && (
+                                      <IntentBadge type={row.interaction_type} />
+                                    )}
+                                    {row.risk_level && (
+                                      <RiskIndicator level={row.risk_level} />
+                                    )}
                                     {when ? (
                                       <span className="crm-record-when">
                                         {when}
                                       </span>
                                     ) : null}
                                   </span>
+                                  {/* AI Summary at top */}
+                                  {row.summary?.trim() && (
+                                    <div className="crm-record-ai-summary">
+                                      {row.summary}
+                                    </div>
+                                  )}
                                   <span className="crm-record-metrics">
                                     <span className="crm-record-metric">
                                       <span className="crm-record-metric-lbl">
@@ -1483,6 +1788,14 @@ function App() {
                                     </span>
                                     <span className="crm-record-metric">
                                       <span className="crm-record-metric-lbl">
+                                        Deal Score
+                                      </span>
+                                      <span className="crm-record-metric-val">
+                                        <DealScoreBar score={row.deal_score ?? 0} />
+                                      </span>
+                                    </span>
+                                    <span className="crm-record-metric">
+                                      <span className="crm-record-metric-lbl">
                                         Industry
                                       </span>
                                       <span className="crm-record-metric-val crm-record-metric-val--clip">
@@ -1492,34 +1805,85 @@ function App() {
                                       </span>
                                     </span>
                                   </span>
-                                  <span className="crm-record-excerpt">
-                                    {excerpt(row.content) || "—"}
-                                  </span>
+                                  {/* Tags chips */}
+                                  {Array.isArray(row.tags) && row.tags.length > 0 && (
+                                    <div className="crm-record-ai-tags">
+                                      {row.tags.map((t, i) => (
+                                        <span key={i} className="crm-ai-tag">{t}</span>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {/* Next Action highlighted box */}
+                                  {row.next_action?.trim() && (
+                                    <div className="crm-record-next-action">
+                                      <span className="crm-record-next-action-label">Next Action</span>
+                                      {row.next_action}
+                                    </div>
+                                  )}
                                 </summary>
                                 <div className="crm-record-body">
+                                  {/* Risk reason */}
+                                  {row.risk_reason?.trim() && (
+                                    <div className="crm-record-risk-detail">
+                                      <span className="crm-record-tags-lbl">Risk Analysis</span>
+                                      <p className="crm-record-risk-reason">{row.risk_reason}</p>
+                                    </div>
+                                  )}
+                                  {/* Pain points */}
+                                  {row.pain_points && (
+                                    <div className="crm-record-tags">
+                                      <span className="crm-record-tags-lbl">Pain Points</span>
+                                      <p className="crm-record-pain-text">{row.pain_points}</p>
+                                    </div>
+                                  )}
+                                  {/* Stakeholders */}
+                                  {Array.isArray(row.stakeholders) && row.stakeholders.length > 0 && (
+                                    <div className="crm-record-tags">
+                                      <span className="crm-record-tags-lbl">Stakeholders</span>
+                                      <div className="crm-record-tag-row">
+                                        {row.stakeholders.map((s, i) => (
+                                          <span key={i} className="crm-record-tag crm-record-tag--stake">{s}</span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                  {/* Advanced CRM fields */}
+                                  {(row.mentioned_company || row.procurement_stage || row.use_case || row.decision_criteria || row.budget_owner || row.implementation_scope) && (
+                                    <div className="crm-record-advanced-fields">
+                                      <span className="crm-record-tags-lbl">Advanced CRM</span>
+                                      <div className="crm-advanced-grid">
+                                        {row.mentioned_company && <div className="crm-adv-item"><span className="crm-adv-label">Company</span><span className="crm-adv-value">{row.mentioned_company}</span></div>}
+                                        {row.procurement_stage && <div className="crm-adv-item"><span className="crm-adv-label">Stage</span><span className="crm-adv-value">{row.procurement_stage}</span></div>}
+                                        {row.use_case && <div className="crm-adv-item"><span className="crm-adv-label">Use Case</span><span className="crm-adv-value">{row.use_case}</span></div>}
+                                        {row.decision_criteria && <div className="crm-adv-item"><span className="crm-adv-label">Decision Criteria</span><span className="crm-adv-value">{row.decision_criteria}</span></div>}
+                                        {row.budget_owner && <div className="crm-adv-item"><span className="crm-adv-label">Budget Owner</span><span className="crm-adv-value">{row.budget_owner}</span></div>}
+                                        {row.implementation_scope && <div className="crm-adv-item"><span className="crm-adv-label">Scope</span><span className="crm-adv-value">{row.implementation_scope}</span></div>}
+                                      </div>
+                                    </div>
+                                  )}
                                   {(row.external_interaction_id ||
                                     (Array.isArray(row.participants) &&
                                       row.participants.length > 0)) && (
-                                    <p className="crm-record-detail-meta">
-                                      {row.external_interaction_id ? (
-                                        <span className="crm-meta-pill">
-                                          ext: {row.external_interaction_id}
-                                        </span>
-                                      ) : null}
-                                      {Array.isArray(row.participants) &&
-                                      row.participants.length > 0 ? (
-                                        <span className="crm-meta-pill">
-                                          {row.participants
-                                            .slice(0, 6)
-                                            .filter(Boolean)
-                                            .join(" · ")}
-                                          {row.participants.length > 6
-                                            ? ` +${row.participants.length - 6}`
-                                            : ""}
-                                        </span>
-                                      ) : null}
-                                    </p>
-                                  )}
+                                      <p className="crm-record-detail-meta">
+                                        {row.external_interaction_id ? (
+                                          <span className="crm-meta-pill">
+                                            ext: {row.external_interaction_id}
+                                          </span>
+                                        ) : null}
+                                        {Array.isArray(row.participants) &&
+                                          row.participants.length > 0 ? (
+                                          <span className="crm-meta-pill">
+                                            {row.participants
+                                              .slice(0, 6)
+                                              .filter(Boolean)
+                                              .join(" · ")}
+                                            {row.participants.length > 6
+                                              ? ` +${row.participants.length - 6}`
+                                              : ""}
+                                          </span>
+                                        ) : null}
+                                      </p>
+                                    )}
                                   <div className="crm-record-links">
                                     <span className="crm-record-links-lbl">
                                       CRM links
@@ -1545,20 +1909,78 @@ function App() {
                                       </span>
                                     </div>
                                   </div>
+                                  <div className="crm-hubspot-row">
+                                    <button
+                                      type="button"
+                                      className={
+                                        "crm-hubspot-btn" +
+                                        (hsSynced ? " crm-hubspot-btn--synced" : "")
+                                      }
+                                      onClick={() => pushToHubspot(row.id)}
+                                      disabled={Boolean(syncingByRecord[row.id])}
+                                      aria-busy={Boolean(syncingByRecord[row.id])}
+                                    >
+                                      {syncingByRecord[row.id] ? (
+                                        <span className="crm-hubspot-btn-inner">
+                                          <Spinner size={12} />
+                                          Syncing…
+                                        </span>
+                                      ) : hsSynced ? "Re-sync to HubSpot" : "Sync to HubSpot"}
+                                    </button>
+                                    {hubspotNoticeByRecord[row.id]?.message ? (
+                                      <span
+                                        className={
+                                          "crm-hubspot-msg " +
+                                          (hubspotNoticeByRecord[row.id]?.type === "success"
+                                            ? "crm-hubspot-msg--success"
+                                            : "crm-hubspot-msg--error")
+                                        }
+                                      >
+                                        {hubspotNoticeByRecord[row.id].message}
+                                        {hubspotNoticeByRecord[row.id]?.linkUrl ? (
+                                          <>
+                                            {" "}
+                                            <a
+                                              href={hubspotNoticeByRecord[row.id].linkUrl}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="crm-hubspot-open-link"
+                                            >
+                                              Open in HubSpot
+                                            </a>
+                                          </>
+                                        ) : null}
+                                      </span>
+                                    ) : hsSynced ? (
+                                      <span className="crm-hubspot-msg crm-hubspot-msg--success">
+                                        Synced to HubSpot ✅
+                                      </span>
+                                    ) : null}
+                                  </div>
                                   <p className="crm-record-detail-meta">
-                                    <span className="crm-meta-pill">
-                                      {row.mapping_method || "—"} ·{" "}
-                                      {row.product?.trim()
-                                        ? `Product: ${row.product}`
-                                        : "Product: —"}{" "}
-                                      ·{" "}
-                                      {row.timeline?.trim()
-                                        ? `Timeline: ${row.timeline}`
-                                        : "Timeline: —"}
+                                    <span
+                                      className="crm-meta-pill"
+                                      title={CRM_ENTITY_LINK_HELP}
+                                    >
+                                      <span className="crm-meta-pill-part">
+                                        {describeCrmMappingMethod(row.mapping_method)}
+                                      </span>
+                                      <span className="crm-meta-pill-sep"> · </span>
+                                      <span className="crm-meta-pill-part">
+                                        {row.product?.trim()
+                                          ? `Product: ${row.product}`
+                                          : "Product: —"}
+                                      </span>
+                                      <span className="crm-meta-pill-sep"> · </span>
+                                      <span className="crm-meta-pill-part">
+                                        {row.timeline?.trim()
+                                          ? `Timeline: ${row.timeline}`
+                                          : "Timeline: —"}
+                                      </span>
                                     </span>
                                   </p>
                                   {Array.isArray(row.competitors) &&
-                                  row.competitors.length > 0 ? (
+                                    row.competitors.length > 0 ? (
                                     <div className="crm-record-tags">
                                       <span className="crm-record-tags-lbl">
                                         Competitors
@@ -1575,13 +1997,33 @@ function App() {
                                       </div>
                                     </div>
                                   ) : null}
-                                  {customEntries.length > 0 ? (
+                                  {hubspotKeyEntries.length > 0 ? (
                                     <div className="crm-record-custom">
                                       <span className="crm-record-tags-lbl">
-                                        Custom fields
+                                        CRM highlights
                                       </span>
                                       <div className="crm-kv-grid">
-                                        {customEntries.map(([k, v]) => (
+                                        {hubspotKeyEntries.map(([k, v, label]) => (
+                                          <div
+                                            key={k}
+                                            className="crm-kv crm-kv--highlight"
+                                          >
+                                            <div className="crm-kv-k">{label}</div>
+                                            <div className="crm-kv-v">
+                                              {String(v)}
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {customEntriesOther.length > 0 ? (
+                                    <div className="crm-record-custom">
+                                      <span className="crm-record-tags-lbl">
+                                        Other custom fields
+                                      </span>
+                                      <div className="crm-kv-grid">
+                                        {customEntriesOther.map(([k, v]) => (
                                           <div key={k} className="crm-kv">
                                             <div className="crm-kv-k">{k}</div>
                                             <div className="crm-kv-v">

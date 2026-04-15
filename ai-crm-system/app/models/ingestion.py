@@ -44,12 +44,23 @@ class StructuredTranscript(BaseModel):
 class ExtractedEntities(BaseModel):
     """Structured fields extracted from the transcript or email body (LLM)."""
 
-    budget: str = Field(default="", description="Budget signal or range if mentioned")
-    intent: str = Field(default="", description="Buyer intent / stage")
+    budget: str = Field(default="", description="Numeric budget as string, or empty")
+    intent: str = Field(default="", description="high | medium | low")
     competitors: list[str] = Field(default_factory=list, description="Named competitors")
-    product: str = Field(default="", description="Product or solution discussed")
-    timeline: str = Field(default="", description="Timing / deadline if mentioned")
+    product: str = Field(default="", description="Clean product/service name")
+    product_version: str = Field(default="", description="Version number or release identifier")
+    timeline: str = Field(default="", description="Decision/implementation timeline phrase")
     industry: str = Field(default="", description="Industry vertical if mentioned")
+    pain_points: str = Field(default="", description="Customer problems/frustrations as text")
+    next_step: str = Field(default="", description="Agreed-upon or implied next step")
+    urgency_reason: str = Field(default="", description="Why the request is time-sensitive")
+    stakeholders: list[str] = Field(default_factory=list, description="People involved in the decision")
+    mentioned_company: str = Field(default="", description="Company the customer represents")
+    procurement_stage: str = Field(default="", description="e.g. evaluation, negotiation, budget approved")
+    use_case: str = Field(default="", description="What the customer intends to use the product for")
+    decision_criteria: str = Field(default="", description="What matters most to the buyer")
+    budget_owner: str = Field(default="", description="Person who controls the budget")
+    implementation_scope: str = Field(default="", description="Rollout scope — company-wide, regional, pilot")
     custom_fields: dict[str, str] = Field(
         default_factory=dict,
         description="Up to 20 CRM-specific string fields (deal qualifiers, etc.)",

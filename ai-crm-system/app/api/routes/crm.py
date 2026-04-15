@@ -51,6 +51,7 @@ class CrmRecordOut(BaseModel):
     budget: int = Field(..., description="Parsed numeric budget")
     intent: str
     product: str
+    product_version: str = ""
     timeline: str
     industry: str = ""
     competitors: list[str] = Field(default_factory=list)
@@ -63,6 +64,24 @@ class CrmRecordOut(BaseModel):
     created_at: datetime | None = None
     external_interaction_id: str | None = None
     participants: list[str] = Field(default_factory=list)
+    # AI Intelligence Layer
+    interaction_type: str = ""
+    deal_score: int = 0
+    risk_level: str = ""
+    risk_reason: str = ""
+    summary: str = ""
+    tags: list[str] = Field(default_factory=list)
+    next_action: str = ""
+    pain_points: str = ""
+    next_step: str = ""
+    urgency_reason: str = ""
+    stakeholders: list[str] = Field(default_factory=list)
+    mentioned_company: str = ""
+    procurement_stage: str = ""
+    use_case: str = ""
+    decision_criteria: str = ""
+    budget_owner: str = ""
+    implementation_scope: str = ""
 
 
 @router.get("/records", response_model=list[CrmRecordOut])
@@ -76,6 +95,7 @@ def list_crm_records(db: Session = Depends(get_db)) -> list[CrmRecordOut]:
             budget=parse_budget_to_int(row.budget),
             intent=row.intent or "",
             product=row.product or "",
+            product_version=getattr(row, "product_version", "") or "",
             timeline=row.timeline or "",
             industry=row.industry or "",
             competitors=_competitors_for_api(row.competitors),
@@ -88,6 +108,23 @@ def list_crm_records(db: Session = Depends(get_db)) -> list[CrmRecordOut]:
             created_at=row.created_at,
             external_interaction_id=row.external_interaction_id,
             participants=_participants_for_api(row.participants),
+            interaction_type=getattr(row, "interaction_type", "") or "",
+            deal_score=getattr(row, "deal_score", 0) or 0,
+            risk_level=getattr(row, "risk_level", "") or "",
+            risk_reason=getattr(row, "risk_reason", "") or "",
+            summary=getattr(row, "summary", "") or "",
+            tags=_competitors_for_api(getattr(row, "tags", None)),
+            next_action=getattr(row, "next_action", "") or "",
+            pain_points=str(getattr(row, "pain_points", "") or ""),
+            next_step=getattr(row, "next_step", "") or "",
+            urgency_reason=getattr(row, "urgency_reason", "") or "",
+            stakeholders=_participants_for_api(getattr(row, "stakeholders", None)),
+            mentioned_company=getattr(row, "mentioned_company", "") or "",
+            procurement_stage=getattr(row, "procurement_stage", "") or "",
+            use_case=getattr(row, "use_case", "") or "",
+            decision_criteria=getattr(row, "decision_criteria", "") or "",
+            budget_owner=getattr(row, "budget_owner", "") or "",
+            implementation_scope=getattr(row, "implementation_scope", "") or "",
         )
         for row in rows
     ]

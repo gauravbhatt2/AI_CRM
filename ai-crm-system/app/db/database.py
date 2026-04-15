@@ -177,6 +177,35 @@ def _ensure_crm_records_interaction_columns(engine: Engine) -> None:
         )
 
 
+def _ensure_crm_records_ai_intelligence_columns(engine: Engine) -> None:
+    """Add AI Intelligence Layer + advanced extraction columns if missing."""
+    from sqlalchemy import text
+
+    stmts = (
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS interaction_type VARCHAR(64) NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS deal_score INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS risk_level VARCHAR(32) NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS risk_reason TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS next_action TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS product_version VARCHAR(256) NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS pain_points TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS next_step TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS urgency_reason TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS stakeholders JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS mentioned_company VARCHAR(512) NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS procurement_stage VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS use_case TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS decision_criteria TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS budget_owner VARCHAR(256) NOT NULL DEFAULT ''",
+        "ALTER TABLE crm_records ADD COLUMN IF NOT EXISTS implementation_scope VARCHAR(256) NOT NULL DEFAULT ''",
+    )
+    with engine.begin() as conn:
+        for s in stmts:
+            conn.execute(text(s))
+
+
 def init_db() -> None:
     """Create all tables defined on Base (idempotent) and align legacy schema."""
     init_engine()
@@ -191,3 +220,4 @@ def init_db() -> None:
     _ensure_contacts_email_column(_engine)
     _ensure_deals_stage_columns(_engine)
     _ensure_crm_records_interaction_columns(_engine)
+    _ensure_crm_records_ai_intelligence_columns(_engine)

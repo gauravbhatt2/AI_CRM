@@ -20,6 +20,7 @@ def create_crm_record(
     mapping_method: str = "rules",
     external_interaction_id: str | None = None,
     participants: list[str] | None = None,
+    ai_intelligence: dict | None = None,
 ) -> CrmRecord:
     """Insert a row from transcript text, structured extraction, and optional CRM links."""
     st: dict | None = None
@@ -36,6 +37,9 @@ def create_crm_record(
             ps = str(p).strip()
             if ps and ps not in plist:
                 plist.append(ps[:512])
+
+    ai = ai_intelligence if isinstance(ai_intelligence, dict) else {}
+
     row = CrmRecord(
         content=content,
         budget=extracted.budget,
@@ -54,6 +58,26 @@ def create_crm_record(
         source_metadata=meta,
         structured_transcript=st,
         mapping_method=(mapping_method or "rules")[:32],
+        # AI Intelligence fields
+        interaction_type=str(ai.get("interaction_type", ""))[:64],
+        deal_score=int(ai.get("deal_score", 0)),
+        risk_level=str(ai.get("risk_level", ""))[:32],
+        risk_reason=str(ai.get("risk_reason", ""))[:2048],
+        summary=str(ai.get("summary", ""))[:4096],
+        tags=list(ai.get("tags", [])),
+        next_action=str(ai.get("next_action", ""))[:2048],
+        # Extraction-enriched fields
+        product_version=getattr(extracted, "product_version", "") or "",
+        pain_points=str(getattr(extracted, "pain_points", "") or ""),
+        next_step=getattr(extracted, "next_step", "") or "",
+        urgency_reason=getattr(extracted, "urgency_reason", "") or "",
+        stakeholders=list(getattr(extracted, "stakeholders", []) or []),
+        mentioned_company=str(getattr(extracted, "mentioned_company", "") or ""),
+        procurement_stage=str(getattr(extracted, "procurement_stage", "") or "")[:128],
+        use_case=str(getattr(extracted, "use_case", "") or ""),
+        decision_criteria=str(getattr(extracted, "decision_criteria", "") or ""),
+        budget_owner=str(getattr(extracted, "budget_owner", "") or "")[:256],
+        implementation_scope=str(getattr(extracted, "implementation_scope", "") or "")[:256],
     )
     db.add(row)
     db.commit()

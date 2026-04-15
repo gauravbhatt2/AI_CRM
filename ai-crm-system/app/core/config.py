@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     # OpenAI Whisper (local); optional WHISPER_MODEL e.g. tiny, base, small, medium, large
     whisper_model: str = "base"
 
+    # HubSpot private app token (used for deal sync).
+    hubspot_api_key: str | None = None
+    # Pipeline id (usually "default"). Stage id is portal-specific (numeric in many accounts).
+    # Leave HUBSPOT_DEAL_STAGE_ID empty to auto-pick the first stage of that pipeline via the API.
+    hubspot_pipeline_id: str = "default"
+    hubspot_deal_stage_id: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

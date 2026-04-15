@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.utils.extraction_refine import infer_timeline_hint
+
 
 def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
     """Return the same shape as the LLM extraction JSON."""
@@ -18,8 +20,19 @@ def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
         "intent": "",
         "competitors": [],
         "product": "",
+        "product_version": "",
         "timeline": "",
         "industry": "",
+        "pain_points": "",
+        "next_step": "",
+        "urgency_reason": "",
+        "stakeholders": [],
+        "mentioned_company": "",
+        "procurement_stage": "",
+        "use_case": "",
+        "decision_criteria": "",
+        "budget_owner": "",
+        "implementation_scope": "",
         "custom_fields": {},
     }
     if not t:
@@ -48,6 +61,7 @@ def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
     if fm:
         company = fm.group(1).strip()
         if len(company) >= 2:
+            out["mentioned_company"] = company[:256]
             out["custom_fields"]["mentioned_company"] = company[:256]
 
     pm = re.search(
@@ -58,14 +72,9 @@ def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
     if pm:
         out["custom_fields"]["contact_person"] = pm.group(1)
 
-    if re.search(r"\bgo\s*live\b", t, re.I):
-        out["timeline"] = "go live (mentioned)"
-    elif re.search(
-        r"\b(?:Q[1-4]\s*\d{4}|next\s+(?:week|month|quarter)|within\s+\d+\s*(?:days|weeks|months))\b",
-        t,
-        re.I,
-    ):
-        out["timeline"] = "timeframe mentioned in conversation"
+    th = infer_timeline_hint(t)
+    if th:
+        out["timeline"] = th
 
     if re.search(r"\b(?:competitor|vs\.?|versus)\s+([A-Z][a-zA-Z]+)", t):
         cm = re.findall(r"\b(?:vs\.?|versus)\s+([A-Z][a-zA-Z0-9]+)", t)
@@ -95,7 +104,12 @@ def merge_extraction_prefer_llm(llm: dict[str, Any], heur: dict[str, Any]) -> di
     if not isinstance(heur, dict):
         return out
 
-    for key in ("budget", "intent", "product", "timeline", "industry"):
+    for key in (
+        "budget", "intent", "product", "product_version", "timeline",
+        "industry", "pain_points", "next_step", "urgency_reason",
+        "mentioned_company", "procurement_stage", "use_case",
+        "decision_criteria", "budget_owner", "implementation_scope",
+    ):
         lv = str(out.get(key) or "").strip()
         hv = str(heur.get(key) or "").strip()
         if not lv and hv:
@@ -103,6 +117,8 @@ def merge_extraction_prefer_llm(llm: dict[str, Any], heur: dict[str, Any]) -> di
 
     if not out.get("competitors") and heur.get("competitors"):
         out["competitors"] = list(heur["competitors"])
+    if not out.get("stakeholders") and heur.get("stakeholders"):
+        out["stakeholders"] = list(heur["stakeholders"])
 
     llm_cf = out.get("custom_fields") if isinstance(out.get("custom_fields"), dict) else {}
     h_cf = heur.get("custom_fields") if isinstance(heur.get("custom_fields"), dict) else {}

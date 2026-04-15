@@ -16,6 +16,11 @@ from openai import RateLimitError
 from app.core.config import settings
 from app.services.groq_llm import get_groq_client
 from app.utils.groq_retry import groq_chat_with_retry
+from app.utils.extraction_refine import (
+    enrich_map_version_custom_field,
+    refine_product_core_field,
+    refine_timeline_core_field,
+)
 from app.utils.heuristic_extraction import heuristic_extract_entities, merge_extraction_prefer_llm
 
 logger = logging.getLogger(__name__)
@@ -25,8 +30,19 @@ DEFAULT_EXTRACTION: dict[str, Any] = {
     "intent": "",
     "competitors": [],
     "product": "",
+    "product_version": "",
     "timeline": "",
     "industry": "",
+    "pain_points": "",
+    "next_step": "",
+    "urgency_reason": "",
+    "stakeholders": [],
+    "mentioned_company": "",
+    "procurement_stage": "",
+    "use_case": "",
+    "decision_criteria": "",
+    "budget_owner": "",
+    "implementation_scope": "",
     "custom_fields": {},
 }
 
@@ -96,7 +112,11 @@ def _unwrap_extraction_payload(data: Any) -> Any:
         inner = data.get(key)
         if isinstance(inner, dict) and any(
             k in inner
-            for k in ("budget", "intent", "product", "industry", "timeline", "competitors", "custom_fields")
+            for k in (
+                "budget", "intent", "product", "industry", "timeline",
+                "competitors", "mentioned_company", "procurement_stage",
+                "use_case", "custom_fields",
+            )
         ):
             return inner
     return data
@@ -105,17 +125,16 @@ def _unwrap_extraction_payload(data: Any) -> Any:
 def _is_effectively_empty(norm: dict[str, Any]) -> bool:
     if not isinstance(norm, dict):
         return True
-    if str(norm.get("budget") or "").strip():
-        return False
-    if str(norm.get("intent") or "").strip():
-        return False
-    if str(norm.get("product") or "").strip():
-        return False
-    if str(norm.get("timeline") or "").strip():
-        return False
-    if str(norm.get("industry") or "").strip():
-        return False
+    for key in (
+        "budget", "intent", "product", "timeline", "industry",
+        "mentioned_company", "procurement_stage", "use_case",
+        "decision_criteria", "pain_points", "next_step",
+    ):
+        if str(norm.get(key) or "").strip():
+            return False
     if norm.get("competitors"):
+        return False
+    if norm.get("stakeholders"):
         return False
     cf = norm.get("custom_fields")
     if isinstance(cf, dict) and cf:
@@ -123,21 +142,89 @@ def _is_effectively_empty(norm: dict[str, Any]) -> bool:
     return True
 
 
+def _coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if x is not None and str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [s.strip() for s in re.split(r"[,;]", value) if s.strip()]
+    return []
+
+
+def _coerce_budget(value: Any) -> str:
+    """Normalize budget to a clean integer string, or empty."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(int(value))
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[,$£€\s]", "", raw)
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([kKmM])?$", cleaned)
+    if m:
+        num = float(m.group(1))
+        suffix = (m.group(2) or "").lower()
+        if suffix == "k":
+            num *= 1_000
+        elif suffix == "m":
+            num *= 1_000_000
+        return str(int(num))
+    digits = re.sub(r"[^\d.]", "", raw)
+    if digits:
+        try:
+            return str(int(float(digits)))
+        except (ValueError, OverflowError):
+            pass
+    return raw
+
+
+def _coerce_intent(value: Any) -> str:
+    """Normalize intent to exactly 'high', 'medium', or 'low'."""
+    raw = str(value or "").strip().lower()
+    if raw in ("high", "medium", "low"):
+        return raw
+    if any(k in raw for k in ("strong", "ready", "commit", "buy", "purchase", "urgent")):
+        return "high"
+    if any(k in raw for k in ("evaluat", "compar", "consider", "review")):
+        return "medium"
+    if any(k in raw for k in ("explor", "info", "gather", "curious", "learn")):
+        return "low"
+    if raw:
+        return "medium"
+    return ""
+
+
 def _normalize(data: Any) -> dict[str, Any]:
     out = dict(DEFAULT_EXTRACTION)
     data = _unwrap_extraction_payload(data)
     if not isinstance(data, dict):
         return out
-    b = data.get("budget")
-    if isinstance(b, (int, float)):
-        out["budget"] = str(b)
-    else:
-        out["budget"] = str(b or "").strip()
-    out["intent"] = str(data.get("intent") or "").strip()
+
+    out["budget"] = _coerce_budget(data.get("budget"))
+    out["intent"] = _coerce_intent(data.get("intent"))
     out["product"] = str(data.get("product") or "").strip()
+    out["product_version"] = str(data.get("product_version") or "").strip()
     out["timeline"] = str(data.get("timeline") or "").strip()
     out["industry"] = str(data.get("industry") or "").strip()
+
+    pp = data.get("pain_points")
+    if isinstance(pp, list):
+        out["pain_points"] = "; ".join(str(x).strip() for x in pp if x is not None and str(x).strip())
+    else:
+        out["pain_points"] = str(pp or "").strip()
+
+    out["next_step"] = str(data.get("next_step") or "").strip()
+    out["urgency_reason"] = str(data.get("urgency_reason") or "").strip()
+    out["stakeholders"] = _coerce_string_list(data.get("stakeholders"))
     out["competitors"] = _coerce_competitors(data.get("competitors"))
+
+    out["mentioned_company"] = str(data.get("mentioned_company") or "").strip()
+    out["procurement_stage"] = str(data.get("procurement_stage") or "").strip()
+    out["use_case"] = str(data.get("use_case") or "").strip()
+    out["decision_criteria"] = str(data.get("decision_criteria") or "").strip()
+    out["budget_owner"] = str(data.get("budget_owner") or "").strip()
+    out["implementation_scope"] = str(data.get("implementation_scope") or "").strip()
+
     out["custom_fields"] = _coerce_custom_fields(data.get("custom_fields"))
     return out
 
@@ -242,6 +329,9 @@ def execute_groq_json_extraction(
 
     heur = heuristic_extract_entities(src_early)
     merged = merge_extraction_prefer_llm(llm_out, heur)
+    refine_product_core_field(merged, src_early)
+    refine_timeline_core_field(merged, src_early)
+    enrich_map_version_custom_field(merged, src_early)
     if _is_effectively_empty(llm_out) and not _is_effectively_empty(merged):
         logger.info(
             "Filled CRM fields from heuristic fallback (Groq unavailable, empty, or rate limited)",

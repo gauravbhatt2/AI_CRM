@@ -22,7 +22,11 @@ from app.db.crm_record_repository import (
 )
 from app.services.groq_speakers import label_segment_speakers
 from app.services.ingestion_pipeline import build_audio_ingest_response, run_transcript_pipeline
-from app.services.transcription_service import WhisperNotInstalledError, transcribe_audio_detailed
+from app.services.transcription_service import (
+    FfmpegRequiredError,
+    WhisperNotInstalledError,
+    transcribe_audio_detailed,
+)
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
 
@@ -134,6 +138,8 @@ async def ingest_audio(
         try:
             detail = await asyncio.to_thread(transcribe_audio_detailed, tmp_path)
         except WhisperNotInstalledError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except FfmpegRequiredError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
 
         plain = (detail.get("plain_text") or "").strip()
