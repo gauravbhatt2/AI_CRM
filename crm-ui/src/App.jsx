@@ -13,14 +13,16 @@ import {
 } from "recharts";
 import "./crm-app.css";
 
-const API_URL = "http://127.0.0.1:8000/ingest/audio";
-const TRANSCRIPT_API_URL = "http://127.0.0.1:8000/ingest/transcript";
-const REVENUE_API_URL = "http://127.0.0.1:8000/api/v1/analytics/revenue";
-const INSIGHTS_API_URL = "http://127.0.0.1:8000/api/v1/analytics/insights";
-const TIMELINE_API_URL = "http://127.0.0.1:8000/api/v1/interactions/timeline";
-const CRM_RECORDS_API_URL = "http://127.0.0.1:8000/api/v1/crm/records";
-const HUBSPOT_PUSH_API_BASE = "http://127.0.0.1:8000/api/v1/hubspot/push";
-const AI_INTEL_API_URL = "http://127.0.0.1:8000/api/v1/analytics/ai-intelligence";
+const API_BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+
+const API_URL = `${API_BASE_URL}/ingest/audio`;
+const TRANSCRIPT_API_URL = `${API_BASE_URL}/ingest/transcript`;
+const REVENUE_API_URL = `${API_BASE_URL}/api/v1/analytics/revenue`;
+const INSIGHTS_API_URL = `${API_BASE_URL}/api/v1/analytics/insights`;
+const TIMELINE_API_URL = `${API_BASE_URL}/api/v1/interactions/timeline`;
+const CRM_RECORDS_API_URL = `${API_BASE_URL}/api/v1/crm/records`;
+const HUBSPOT_PUSH_API_BASE = `${API_BASE_URL}/api/v1/hubspot/push`;
+const AI_INTEL_API_URL = `${API_BASE_URL}/api/v1/analytics/ai-intelligence`;
 
 const HS_SYNC_STORAGE_KEY = "ai_crm_hubspot_sync_v1";
 const CRM_HUBSPOT_FIELD_KEYS = [
@@ -93,8 +95,7 @@ function intentMatchesFilter(intentRaw, filter) {
 function friendlyFetchError(message) {
   if (message === "Failed to fetch" || message === "Load failed") {
     return (
-      "Cannot reach the API. Start the FastAPI server on port 8000 " +
-      "(e.g. uvicorn app.main:app --reload), then try again. " +
+      "Cannot reach the API. Start the FastAPI server (e.g. uvicorn app.main:app --reload), then try again. " +
       "CORS allows this Vite dev URL."
     );
   }
@@ -266,6 +267,13 @@ function App() {
   const [aiIntelError, setAiIntelError] = useState(null);
 
   const [activeSection, setActiveSection] = useState("dashboard");
+
+  // HubSpot preview and edit modal
+  const [hsPreviewOpen, setHsPreviewOpen] = useState(false);
+  const [hsPreviewRecordId, setHsPreviewRecordId] = useState(null);
+  const [hsPreviewData, setHsPreviewData] = useState(null);
+  const [hsPreviewEdits, setHsPreviewEdits] = useState({});
+  const [hsPreviewSyncing, setHsPreviewSyncing] = useState(false);
 
   const filteredRevenueRecords = useMemo(() => {
     if (!revenueData?.records?.length) return [];
@@ -439,6 +447,61 @@ function App() {
     }
   };
 
+  // Build the preview data to show user what will be sent
+  const buildHubspotPreviewData = (record) => {
+    const normalizedIntent = String(record.intent || "").trim().toLowerCase();
+    const validIntent = ["low", "medium", "high"];
+    const intentValue = validIntent.includes(normalizedIntent) ? normalizedIntent : "low";
+
+    return {
+      id: record.id,
+      budget: record.budget || "—",
+      intent: intentValue,
+      industry: record.industry || "—",
+      deal_score: record.deal_score ?? "—",
+      risk_level: record.risk_level || "—",
+      next_action: record.next_action || "—",
+      summary: record.summary || "—",
+      mentioned_company: record.mentioned_company || "—",
+      procurement_stage: record.procurement_stage || "—",
+      use_case: record.use_case || "—",
+      decision_criteria: record.decision_criteria || "—",
+      budget_owner: record.budget_owner || "—",
+      implementation_scope: record.implementation_scope || "—",
+      pain_points: record.pain_points || "—",
+      product: record.product || "—",
+      timeline: record.timeline || "—",
+      account_id: record.account_id || "—",
+      contact_id: record.contact_id || "—",
+      deal_id: record.deal_id || "—",
+      stakeholders: Array.isArray(record.stakeholders) ? record.stakeholders : [],
+      competitors: Array.isArray(record.competitors) ? record.competitors : [],
+      tags: Array.isArray(record.tags) ? record.tags : [],
+      custom_fields: record.custom_fields || {},
+    };
+  };
+
+  // Open preview modal instead of directly syncing
+  const openHubspotPreview = (recordId) => {
+    const record = crmRecords?.find((r) => r.id === recordId);
+    if (!record) return;
+    
+    setHsPreviewRecordId(recordId);
+    setHsPreviewData(buildHubspotPreviewData(record));
+    setHsPreviewEdits({});
+    setHsPreviewOpen(true);
+  };
+
+  // Close preview modal
+  const closeHubspotPreview = () => {
+    setHsPreviewOpen(false);
+    setHsPreviewRecordId(null);
+    setHsPreviewData(null);
+    setHsPreviewEdits({});
+    setHsPreviewSyncing(false);
+  };
+
+  // Actually push to HubSpot (called after preview confirmation)
   const pushToHubspot = async (recordId) => {
     setSyncingByRecord((prev) => ({ ...prev, [recordId]: true }));
     setHubspotNoticeByRecord((prev) => ({ ...prev, [recordId]: null }));
@@ -486,6 +549,8 @@ function App() {
           linkUrl: openUrl || null,
         },
       }));
+      // Close preview after successful sync
+      closeHubspotPreview();
     } catch (err) {
       const raw = err instanceof Error ? err.message : "HubSpot sync failed.";
       setHubspotNoticeByRecord((prev) => ({
@@ -494,6 +559,7 @@ function App() {
       }));
     } finally {
       setSyncingByRecord((prev) => ({ ...prev, [recordId]: false }));
+      setHsPreviewSyncing(false);
     }
   };
 
@@ -1916,7 +1982,7 @@ function App() {
                                         "crm-hubspot-btn" +
                                         (hsSynced ? " crm-hubspot-btn--synced" : "")
                                       }
-                                      onClick={() => pushToHubspot(row.id)}
+                                      onClick={() => openHubspotPreview(row.id)}
                                       disabled={Boolean(syncingByRecord[row.id])}
                                       aria-busy={Boolean(syncingByRecord[row.id])}
                                     >
@@ -2054,6 +2120,372 @@ function App() {
             )}
           </div>
         </main>
+
+        {/* HubSpot Preview and Edit Modal */}
+        {hsPreviewOpen && hsPreviewData && (
+          <div className="crm-modal-overlay" onClick={closeHubspotPreview}>
+            <div className="crm-modal crm-hubspot-preview-modal" onClick={(e) => e.stopPropagation()}>
+              <button
+                type="button"
+                className="crm-modal-close"
+                onClick={closeHubspotPreview}
+                aria-label="Close preview"
+              >
+                ✕
+              </button>
+              
+              <div className="crm-modal-header">
+                <h2 className="crm-modal-title">
+                  Preview for HubSpot Sync
+                </h2>
+                <p className="crm-modal-subtitle">
+                  Review and edit the data below before syncing to HubSpot. Changes are only applied to HubSpot, not to your local record.
+                </p>
+              </div>
+
+              <div className="crm-modal-body">
+                <div className="crm-preview-sections">
+                  {/* Key Metrics Section */}
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">📊 Key Metrics</h3>
+                    <div className="crm-preview-grid">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Budget</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.budget ?? hsPreviewData.budget}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              budget: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Intent</label>
+                        <select
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.intent ?? hsPreviewData.intent}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              intent: e.target.value,
+                            })
+                          }
+                        >
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                        </select>
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Deal Score</label>
+                        <input
+                          type="number"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.deal_score ?? hsPreviewData.deal_score}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              deal_score: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Industry</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.industry ?? hsPreviewData.industry}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              industry: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Risk Level</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.risk_level ?? hsPreviewData.risk_level}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              risk_level: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Product</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.product ?? hsPreviewData.product}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              product: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Company & Procurement Section */}
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">🏢 Company & Procurement</h3>
+                    <div className="crm-preview-grid">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Mentioned Company</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.mentioned_company ?? hsPreviewData.mentioned_company}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              mentioned_company: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Procurement Stage</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.procurement_stage ?? hsPreviewData.procurement_stage}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              procurement_stage: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Use Case</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.use_case ?? hsPreviewData.use_case}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              use_case: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Budget Owner</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.budget_owner ?? hsPreviewData.budget_owner}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              budget_owner: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Implementation Scope</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.implementation_scope ?? hsPreviewData.implementation_scope}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              implementation_scope: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Timeline</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.timeline ?? hsPreviewData.timeline}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              timeline: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Strategic Information Section */}
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">💡 Strategic Information</h3>
+                    <div className="crm-preview-full-width">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">AI Summary</label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={hsPreviewEdits.summary ?? hsPreviewData.summary}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              summary: e.target.value,
+                            })
+                          }
+                          rows="3"
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Next Action</label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={hsPreviewEdits.next_action ?? hsPreviewData.next_action}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              next_action: e.target.value,
+                            })
+                          }
+                          rows="2"
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Pain Points</label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={hsPreviewEdits.pain_points ?? hsPreviewData.pain_points}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              pain_points: e.target.value,
+                            })
+                          }
+                          rows="3"
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Decision Criteria</label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={hsPreviewEdits.decision_criteria ?? hsPreviewData.decision_criteria}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              decision_criteria: e.target.value,
+                            })
+                          }
+                          rows="3"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* CRM Links Section */}
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">🔗 CRM Links</h3>
+                    <div className="crm-preview-grid">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Account ID</label>
+                        <div className="crm-preview-value">{hsPreviewData.account_id}</div>
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Contact ID</label>
+                        <div className="crm-preview-value">{hsPreviewData.contact_id}</div>
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Deal ID</label>
+                        <div className="crm-preview-value">{hsPreviewData.deal_id}</div>
+                      </div>
+                    </div>
+                    <p className="crm-preview-readonly-note">
+                      These CRM links are display-only and cannot be edited.
+                    </p>
+                  </div>
+
+                  {/* Tags & Relationships */}
+                  {(hsPreviewData.stakeholders?.length > 0 || hsPreviewData.competitors?.length > 0 || hsPreviewData.tags?.length > 0) && (
+                    <div className="crm-preview-section">
+                      <h3 className="crm-preview-section-title">🏷️ Tags & Relationships</h3>
+                      {hsPreviewData.tags?.length > 0 && (
+                        <div className="crm-preview-tags-group">
+                          <label className="crm-preview-label">Tags</label>
+                          <div className="crm-preview-tags">
+                            {hsPreviewData.tags.map((tag, i) => (
+                              <span key={i} className="crm-preview-tag">{tag}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {hsPreviewData.stakeholders?.length > 0 && (
+                        <div className="crm-preview-tags-group">
+                          <label className="crm-preview-label">Stakeholders</label>
+                          <div className="crm-preview-tags">
+                            {hsPreviewData.stakeholders.map((s, i) => (
+                              <span key={i} className="crm-preview-tag crm-preview-tag--stake">{s}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {hsPreviewData.competitors?.length > 0 && (
+                        <div className="crm-preview-tags-group">
+                          <label className="crm-preview-label">Competitors</label>
+                          <div className="crm-preview-tags">
+                            {hsPreviewData.competitors.map((comp, i) => (
+                              <span key={i} className="crm-preview-tag crm-preview-tag--competitor">{comp}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="crm-modal-footer">
+                <button
+                  type="button"
+                  className="crm-modal-btn crm-modal-btn--cancel"
+                  onClick={closeHubspotPreview}
+                  disabled={hsPreviewSyncing}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="crm-modal-btn crm-modal-btn--confirm"
+                  onClick={() => {
+                    setHsPreviewSyncing(true);
+                    pushToHubspot(hsPreviewRecordId);
+                  }}
+                  disabled={hsPreviewSyncing}
+                  aria-busy={hsPreviewSyncing}
+                >
+                  {hsPreviewSyncing ? (
+                    <span className="crm-modal-btn-inner">
+                      <Spinner size={12} />
+                      Syncing…
+                    </span>
+                  ) : (
+                    "✓ Confirm & Sync to HubSpot"
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
