@@ -61,26 +61,37 @@ def llm_suggest_crm_links(
     contacts = _recent_contacts(db)
     ext_json = json.dumps(extracted, ensure_ascii=False)[:8000]
 
-    prompt = f"""You map a sales interaction to CRM records using entity resolution.
+    prompt = f"""You perform conservative CRM entity resolution.
 
-Given:
+Inputs:
 1) Conversation text
-2) Extracted structured fields (JSON)
-3) Recent accounts (id, name) — prefer linking when clearly the same company
-4) Recent contacts (id, name, account_id) — prefer linking when clearly the same person
+2) Extracted structured fields
+3) Recent accounts (id, name)
+4) Recent contacts (id, name, account_id)
 
-Return ONLY valid JSON:
+Goal:
+- Link to existing records only when identity is explicit or near-certain.
+- If uncertain, keep match ids as null and provide best resolved names.
+- Transcript may include ASR artifacts; normalize entities conservatively.
+
+Return ONLY strict JSON:
 {{
   "match_account_id": <number or null>,
   "match_contact_id": <number or null>,
-  "resolved_company": "<best company name to use if creating or matching>",
-  "resolved_contact_person": "<best person name if known, else empty string>"
+  "resolved_company": "<company name or empty string>",
+  "resolved_contact_person": "<person name or empty string>"
 }}
 
-Rules:
-- Only use match_account_id / match_contact_id if they clearly fit the conversation; else null.
-- If unsure, set ids to null and fill resolved_company / resolved_contact_person from the text.
-- resolved_company should not be empty unless truly unknown.
+Matching rules:
+- Do not guess ids from partial similarity alone.
+- Prefer exact or near-exact naming alignment with conversation evidence.
+- A contact id is valid only if that person match is clear.
+- If contact is matched and account is also clear, set both ids.
+- If multiple plausible records exist, set ids to null.
+- resolved_company should be canonical cased text from evidence; else empty string.
+- resolved_company must exclude trailing helper words ("is", "from", "the", "company", punctuation).
+- resolved_contact_person should be a person name only (no title/company); else empty string.
+- No extra keys, no explanation.
 
 Extracted fields:
 {ext_json}

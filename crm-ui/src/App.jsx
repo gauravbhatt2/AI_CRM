@@ -13,14 +13,16 @@ import {
 } from "recharts";
 import "./crm-app.css";
 
-const API_URL = "http://127.0.0.1:8000/ingest/audio";
-const TRANSCRIPT_API_URL = "http://127.0.0.1:8000/ingest/transcript";
-const REVENUE_API_URL = "http://127.0.0.1:8000/api/v1/analytics/revenue";
-const INSIGHTS_API_URL = "http://127.0.0.1:8000/api/v1/analytics/insights";
-const TIMELINE_API_URL = "http://127.0.0.1:8000/api/v1/interactions/timeline";
-const CRM_RECORDS_API_URL = "http://127.0.0.1:8000/api/v1/crm/records";
-const HUBSPOT_PUSH_API_BASE = "http://127.0.0.1:8000/api/v1/hubspot/push";
-const AI_INTEL_API_URL = "http://127.0.0.1:8000/api/v1/analytics/ai-intelligence";
+const API_BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+
+const API_URL = `${API_BASE_URL}/ingest/audio`;
+const TRANSCRIPT_API_URL = `${API_BASE_URL}/ingest/transcript`;
+const REVENUE_API_URL = `${API_BASE_URL}/api/v1/analytics/revenue`;
+const INSIGHTS_API_URL = `${API_BASE_URL}/api/v1/analytics/insights`;
+const TIMELINE_API_URL = `${API_BASE_URL}/api/v1/interactions/timeline`;
+const CRM_RECORDS_API_URL = `${API_BASE_URL}/api/v1/crm/records`;
+const HUBSPOT_PUSH_API_BASE = `${API_BASE_URL}/api/v1/hubspot/push`;
+const AI_INTEL_API_URL = `${API_BASE_URL}/api/v1/analytics/ai-intelligence`;
 
 const HS_SYNC_STORAGE_KEY = "ai_crm_hubspot_sync_v1";
 const CRM_HUBSPOT_FIELD_KEYS = [
@@ -111,11 +113,15 @@ function parseApiError(text, status) {
   return `Request failed (${status})`;
 }
 
-function excerpt(text, max = 220) {
-  const s = (text || "").trim();
-  if (!s) return "";
-  if (s.length <= max) return s;
-  return `${s.slice(0, max).trim()}…`;
+function crmRecordUrl(id) {
+  return `${CRM_RECORDS_API_URL}/${id}`;
+}
+
+function splitCsvLike(text) {
+  return String(text || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function formatRecordWhen(iso) {
@@ -266,6 +272,38 @@ function App() {
   const [aiIntelError, setAiIntelError] = useState(null);
 
   const [activeSection, setActiveSection] = useState("dashboard");
+  const [approvalData, setApprovalData] = useState(null);
+  const [approvalEdits, setApprovalEdits] = useState({});
+  const [approvalSaving, setApprovalSaving] = useState(false);
+  const [approvalSaved, setApprovalSaved] = useState(false);
+  const [hsPreviewOpen, setHsPreviewOpen] = useState(false);
+  const [hsPreviewRecordId, setHsPreviewRecordId] = useState(null);
+  const [hsPreviewData, setHsPreviewData] = useState(null);
+  const [hsPreviewEdits, setHsPreviewEdits] = useState({});
+  const [hsPreviewSyncing, setHsPreviewSyncing] = useState(false);
+  const [hsTagInput, setHsTagInput] = useState("");
+  const [hsStakeholderInput, setHsStakeholderInput] = useState("");
+
+  const loadApprovalRecord = useCallback(async (recordId) => {
+    if (!recordId) return;
+    try {
+      const res = await fetch(crmRecordUrl(recordId), {
+        mode: "cors",
+        cache: "no-store",
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) {
+        throw new Error(parseApiError(text, res.status));
+      }
+      setApprovalData(data);
+      setApprovalEdits({});
+      setApprovalSaved(false);
+    } catch {
+      // Keep upload flow resilient; approval panel is optional.
+      setApprovalData(null);
+    }
+  }, []);
 
   const filteredRevenueRecords = useMemo(() => {
     if (!revenueData?.records?.length) return [];
@@ -439,12 +477,98 @@ function App() {
     }
   };
 
+  const buildHubspotPreviewData = (record) => {
+    const normalizedIntent = String(record.intent || "").trim().toLowerCase();
+    const validIntent = ["low", "medium", "high"];
+    const intentValue = validIntent.includes(normalizedIntent)
+      ? normalizedIntent
+      : "low";
+
+    return {
+      id: record.id,
+      budget: record.budget || "—",
+      intent: intentValue,
+      industry: record.industry || "—",
+      deal_score: record.deal_score ?? "—",
+      risk_level: record.risk_level || "—",
+      next_action: record.next_action || "—",
+      summary: record.summary || "—",
+      mentioned_company: record.mentioned_company || "—",
+      procurement_stage: record.procurement_stage || "—",
+      use_case: record.use_case || "—",
+      decision_criteria: record.decision_criteria || "—",
+      budget_owner: record.budget_owner || "—",
+      implementation_scope: record.implementation_scope || "—",
+      pain_points: record.pain_points || "—",
+      product: record.product || "—",
+      timeline: record.timeline || "—",
+      account_id: record.account_id || "—",
+      contact_id: record.contact_id || "—",
+      deal_id: record.deal_id || "—",
+      stakeholders: Array.isArray(record.stakeholders) ? record.stakeholders : [],
+      competitors: Array.isArray(record.competitors) ? record.competitors : [],
+      tags: Array.isArray(record.tags) ? record.tags : [],
+      custom_fields: record.custom_fields || {},
+    };
+  };
+
+  const openHubspotPreview = (recordId) => {
+    const record = crmRecords?.find((r) => r.id === recordId);
+    if (!record) return;
+    setHsPreviewRecordId(recordId);
+    setHsPreviewData(buildHubspotPreviewData(record));
+    setHsPreviewEdits({});
+    setHsTagInput("");
+    setHsStakeholderInput("");
+    setHsPreviewOpen(true);
+  };
+
+  const closeHubspotPreview = () => {
+    setHsPreviewOpen(false);
+    setHsPreviewRecordId(null);
+    setHsPreviewData(null);
+    setHsPreviewEdits({});
+    setHsPreviewSyncing(false);
+    setHsTagInput("");
+    setHsStakeholderInput("");
+  };
+
+  const getPreviewList = (field) => {
+    const fromEdits = hsPreviewEdits?.[field];
+    const fromBase = hsPreviewData?.[field];
+    const src = Array.isArray(fromEdits)
+      ? fromEdits
+      : Array.isArray(fromBase)
+        ? fromBase
+        : [];
+    return src.filter((x) => String(x || "").trim() !== "");
+  };
+
+  const addPreviewListItem = (field, raw) => {
+    const val = String(raw || "").trim();
+    if (!val) return;
+    const current = getPreviewList(field);
+    if (current.some((x) => String(x).toLowerCase() === val.toLowerCase())) return;
+    setHsPreviewEdits({ ...hsPreviewEdits, [field]: [...current, val] });
+  };
+
+  const removePreviewListItem = (field, idx) => {
+    const current = getPreviewList(field);
+    const next = current.filter((_, i) => i !== idx);
+    setHsPreviewEdits({ ...hsPreviewEdits, [field]: next });
+  };
+
   const pushToHubspot = async (recordId) => {
     setSyncingByRecord((prev) => ({ ...prev, [recordId]: true }));
     setHubspotNoticeByRecord((prev) => ({ ...prev, [recordId]: null }));
     try {
+      const hasOverrides = hsPreviewEdits && Object.keys(hsPreviewEdits).length > 0;
       const res = await fetch(`${HUBSPOT_PUSH_API_BASE}/${recordId}`, {
         method: "POST",
+        headers: hasOverrides ? { "Content-Type": "application/json" } : undefined,
+        body: hasOverrides
+          ? JSON.stringify({ hubspot_overrides: hsPreviewEdits })
+          : undefined,
         mode: "cors",
         cache: "no-store",
       });
@@ -486,6 +610,7 @@ function App() {
           linkUrl: openUrl || null,
         },
       }));
+      closeHubspotPreview();
     } catch (err) {
       const raw = err instanceof Error ? err.message : "HubSpot sync failed.";
       setHubspotNoticeByRecord((prev) => ({
@@ -494,6 +619,7 @@ function App() {
       }));
     } finally {
       setSyncingByRecord((prev) => ({ ...prev, [recordId]: false }));
+      setHsPreviewSyncing(false);
     }
   };
 
@@ -610,6 +736,9 @@ function App() {
     setLoading(true);
     setError(null);
     setResult(null);
+    setApprovalData(null);
+    setApprovalEdits({});
+    setApprovalSaved(false);
 
     try {
       if (inputMode === "audio") {
@@ -639,6 +768,7 @@ function App() {
 
         setResult(data);
         await refreshDashboard();
+        await loadApprovalRecord(data.record_id);
       } else {
         const trimmed = transcriptText.trim();
 
@@ -671,6 +801,7 @@ function App() {
 
         setResult({ ...data, transcript: trimmed });
         await refreshDashboard();
+        await loadApprovalRecord(data.record_id);
       }
     } catch (err) {
       const raw =
@@ -678,6 +809,86 @@ function App() {
       setError(friendlyFetchError(raw));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const updateApprovalField = (field, value) => {
+    setApprovalSaved(false);
+    setApprovalEdits((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const toggleApprovalSegmentSpeaker = (index) => {
+    const baseStructured =
+      approvalEdits.structured_transcript ||
+      approvalData?.structured_transcript ||
+      result?.structured_transcript;
+    if (!baseStructured || !Array.isArray(baseStructured.segments)) return;
+
+    const seen = new Set();
+    const inferred = [];
+    baseStructured.segments.forEach((seg) => {
+      const name = String(seg?.speaker || "").trim();
+      if (name && !seen.has(name.toLowerCase())) {
+        seen.add(name.toLowerCase());
+        inferred.push(name);
+      }
+    });
+    const options =
+      inferred.length >= 2
+        ? inferred.slice(0, 2)
+        : inferred.length === 1
+          ? [inferred[0], inferred[0].toLowerCase() === "sales" ? "Customer" : "Sales"]
+          : ["Sales", "Customer"];
+
+    const nextSegments = baseStructured.segments.map((seg, i) => {
+      if (i !== index) return seg;
+      const current = String(seg?.speaker || "").trim();
+      const currentIdx = options.findIndex(
+        (o) => o.toLowerCase() === current.toLowerCase(),
+      );
+      const nextSpeaker =
+        currentIdx === -1 ? options[0] : options[(currentIdx + 1) % options.length];
+      return { ...seg, speaker: nextSpeaker };
+    });
+
+    updateApprovalField("structured_transcript", {
+      ...baseStructured,
+      segments: nextSegments,
+    });
+  };
+
+  const approveIngestionRecord = async () => {
+    if (!result?.record_id) return;
+    if (!approvalEdits || Object.keys(approvalEdits).length === 0) {
+      setApprovalSaved(true);
+      return;
+    }
+
+    setApprovalSaving(true);
+    setApprovalSaved(false);
+    try {
+      const res = await fetch(crmRecordUrl(result.record_id), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(approvalEdits),
+        mode: "cors",
+        cache: "no-store",
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) {
+        throw new Error(parseApiError(text, res.status));
+      }
+      setApprovalData(data);
+      setApprovalEdits({});
+      setApprovalSaved(true);
+      await refreshDashboard();
+    } catch (err) {
+      const raw =
+        err instanceof Error ? err.message : "Failed to approve record changes.";
+      setError(friendlyFetchError(raw));
+    } finally {
+      setApprovalSaving(false);
     }
   };
 
@@ -708,22 +919,40 @@ function App() {
 
   function renderUploadResults() {
     if (!result || loading) return null;
+    const reviewRecord =
+      approvalData && Number(approvalData.id) === Number(result.record_id)
+        ? approvalData
+        : null;
+    const reviewStructured =
+      approvalEdits.structured_transcript ||
+      reviewRecord?.structured_transcript ||
+      result.structured_transcript;
+    const reviewSource = reviewRecord || {};
+    const reviewValue = (field, fallback = "") =>
+      approvalEdits[field] ?? reviewSource[field] ?? fallback;
 
     const transcriptBlock =
-      result.structured_transcript?.segments?.length > 0 ? (
+      reviewStructured?.segments?.length > 0 ? (
         <div className="crm-card">
           <div className="crm-section-title-row">
             <span className="crm-section-title" style={{ marginBottom: 0 }}>Transcript</span>
             <span className="crm-meta-pill">
-              {result.structured_transcript.segments.length} segments · speakers
+              {reviewStructured.segments.length} segments · click speaker to switch
             </span>
           </div>
           <div className="crm-seg-list">
-            {result.structured_transcript.segments.map((seg, i) => (
+            {reviewStructured.segments.map((seg, i) => (
               <div key={i} className="crm-seg">
                 <div className="crm-seg-head">
                   <span className="crm-seg-time">{formatTimestamp(seg.start)} – {formatTimestamp(seg.end)}</span>
-                  {seg.speaker && <span className="crm-seg-sp">{seg.speaker}</span>}
+                  <button
+                    type="button"
+                    className="crm-seg-sp crm-seg-sp-btn"
+                    onClick={() => toggleApprovalSegmentSpeaker(i)}
+                    title="Toggle speaker"
+                  >
+                    {seg.speaker || "Unknown"}
+                  </button>
                 </div>
                 <p className="crm-seg-body">{seg.text}</p>
               </div>
@@ -745,7 +974,7 @@ function App() {
             <div className="crm-result-hero-main">
               <p className="crm-result-hero-title">✅ Ingestion complete</p>
               <p className="crm-result-hero-sub">
-                AI extraction, deal scoring, and risk analysis saved to CRM.
+                Review, edit, and approve before final CRM save + HubSpot sync.
               </p>
             </div>
             <div className="crm-result-hero-ids">
@@ -772,6 +1001,120 @@ function App() {
               <div className="crm-strip-label">Timeline</div>
               <div className="crm-strip-value">{showField(ex?.timeline)}</div>
             </div>
+          </div>
+        </div>
+
+        <div className="crm-card">
+          <div className="crm-section-title-row">
+            <span className="crm-section-title" style={{ marginBottom: 0 }}>
+              Review before save
+            </span>
+            <span className="crm-meta-pill">
+              Editable fields + speaker corrections
+            </span>
+          </div>
+          <div className="crm-grid crm-approval-grid">
+            <label className="crm-approval-field">
+              <span className="crm-field-label">Mentioned company</span>
+              <input
+                value={reviewValue("mentioned_company", ex?.mentioned_company || "")}
+                onChange={(e) => updateApprovalField("mentioned_company", e.target.value)}
+              />
+            </label>
+            <label className="crm-approval-field">
+              <span className="crm-field-label">Budget</span>
+              <input
+                value={reviewValue("budget", ex?.budget || "")}
+                onChange={(e) => updateApprovalField("budget", e.target.value)}
+              />
+            </label>
+            <label className="crm-approval-field">
+              <span className="crm-field-label">Intent</span>
+              <select
+                value={String(reviewValue("intent", ex?.intent || "medium")).toLowerCase() || "medium"}
+                onChange={(e) => updateApprovalField("intent", e.target.value)}
+              >
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+              </select>
+            </label>
+            <label className="crm-approval-field">
+              <span className="crm-field-label">Industry</span>
+              <input
+                value={reviewValue("industry", ex?.industry || "")}
+                onChange={(e) => updateApprovalField("industry", e.target.value)}
+              />
+            </label>
+            <label className="crm-approval-field">
+              <span className="crm-field-label">Product</span>
+              <input
+                value={reviewValue("product", ex?.product || "")}
+                onChange={(e) => updateApprovalField("product", e.target.value)}
+              />
+            </label>
+            <label className="crm-approval-field">
+              <span className="crm-field-label">Timeline</span>
+              <input
+                value={reviewValue("timeline", ex?.timeline || "")}
+                onChange={(e) => updateApprovalField("timeline", e.target.value)}
+              />
+            </label>
+            <label className="crm-approval-field crm-approval-field--full">
+              <span className="crm-field-label">Pain points</span>
+              <textarea
+                rows={2}
+                value={reviewValue("pain_points", ex?.pain_points || "")}
+                onChange={(e) => updateApprovalField("pain_points", e.target.value)}
+              />
+            </label>
+            <label className="crm-approval-field crm-approval-field--full">
+              <span className="crm-field-label">Stakeholders (comma separated)</span>
+              <input
+                value={Array.isArray(reviewValue("stakeholders", ex?.stakeholders || []))
+                  ? reviewValue("stakeholders", ex?.stakeholders || []).join(", ")
+                  : reviewValue("stakeholders", "")}
+                onChange={(e) => updateApprovalField("stakeholders", splitCsvLike(e.target.value))}
+              />
+            </label>
+            <label className="crm-approval-field crm-approval-field--full">
+              <span className="crm-field-label">Competitors (comma separated)</span>
+              <input
+                value={Array.isArray(reviewValue("competitors", ex?.competitors || []))
+                  ? reviewValue("competitors", ex?.competitors || []).join(", ")
+                  : reviewValue("competitors", "")}
+                onChange={(e) => updateApprovalField("competitors", splitCsvLike(e.target.value))}
+              />
+            </label>
+            <label className="crm-approval-field crm-approval-field--full">
+              <span className="crm-field-label">Summary</span>
+              <textarea
+                rows={3}
+                value={reviewValue("summary", "")}
+                onChange={(e) => updateApprovalField("summary", e.target.value)}
+              />
+            </label>
+            <label className="crm-approval-field crm-approval-field--full">
+              <span className="crm-field-label">Next action</span>
+              <textarea
+                rows={2}
+                value={reviewValue("next_action", "")}
+                onChange={(e) => updateApprovalField("next_action", e.target.value)}
+              />
+            </label>
+          </div>
+          <div className="crm-approval-actions">
+            <button
+              type="button"
+              className="crm-records-reset-filters"
+              onClick={approveIngestionRecord}
+              disabled={approvalSaving}
+            >
+              {approvalSaving ? "Saving..." : "Approve and save to CRM"}
+            </button>
+            {approvalSaved && (
+              <span className="crm-approval-ok">Saved. CRM records and HubSpot preview now use approved values.</span>
+            )}
           </div>
         </div>
 
@@ -1830,37 +2173,35 @@ function App() {
                                     </div>
                                   )}
                                   {/* Pain points */}
-                                  {row.pain_points && (
-                                    <div className="crm-record-tags">
-                                      <span className="crm-record-tags-lbl">Pain Points</span>
-                                      <p className="crm-record-pain-text">{row.pain_points}</p>
-                                    </div>
-                                  )}
+                                  <div className="crm-record-tags">
+                                    <span className="crm-record-tags-lbl">Pain Points</span>
+                                    <p className="crm-record-pain-text">{row.pain_points?.trim() ? row.pain_points : "—"}</p>
+                                  </div>
                                   {/* Stakeholders */}
-                                  {Array.isArray(row.stakeholders) && row.stakeholders.length > 0 && (
-                                    <div className="crm-record-tags">
-                                      <span className="crm-record-tags-lbl">Stakeholders</span>
+                                  <div className="crm-record-tags">
+                                    <span className="crm-record-tags-lbl">Stakeholders</span>
+                                    {Array.isArray(row.stakeholders) && row.stakeholders.length > 0 ? (
                                       <div className="crm-record-tag-row">
                                         {row.stakeholders.map((s, i) => (
                                           <span key={i} className="crm-record-tag crm-record-tag--stake">{s}</span>
                                         ))}
                                       </div>
-                                    </div>
-                                  )}
+                                    ) : (
+                                      <p className="crm-record-pain-text">—</p>
+                                    )}
+                                  </div>
                                   {/* Advanced CRM fields */}
-                                  {(row.mentioned_company || row.procurement_stage || row.use_case || row.decision_criteria || row.budget_owner || row.implementation_scope) && (
-                                    <div className="crm-record-advanced-fields">
-                                      <span className="crm-record-tags-lbl">Advanced CRM</span>
-                                      <div className="crm-advanced-grid">
-                                        {row.mentioned_company && <div className="crm-adv-item"><span className="crm-adv-label">Company</span><span className="crm-adv-value">{row.mentioned_company}</span></div>}
-                                        {row.procurement_stage && <div className="crm-adv-item"><span className="crm-adv-label">Stage</span><span className="crm-adv-value">{row.procurement_stage}</span></div>}
-                                        {row.use_case && <div className="crm-adv-item"><span className="crm-adv-label">Use Case</span><span className="crm-adv-value">{row.use_case}</span></div>}
-                                        {row.decision_criteria && <div className="crm-adv-item"><span className="crm-adv-label">Decision Criteria</span><span className="crm-adv-value">{row.decision_criteria}</span></div>}
-                                        {row.budget_owner && <div className="crm-adv-item"><span className="crm-adv-label">Budget Owner</span><span className="crm-adv-value">{row.budget_owner}</span></div>}
-                                        {row.implementation_scope && <div className="crm-adv-item"><span className="crm-adv-label">Scope</span><span className="crm-adv-value">{row.implementation_scope}</span></div>}
-                                      </div>
+                                  <div className="crm-record-advanced-fields">
+                                    <span className="crm-record-tags-lbl">Advanced CRM</span>
+                                    <div className="crm-advanced-grid">
+                                      <div className="crm-adv-item"><span className="crm-adv-label">Company</span><span className="crm-adv-value">{row.mentioned_company?.trim() ? row.mentioned_company : "—"}</span></div>
+                                      <div className="crm-adv-item"><span className="crm-adv-label">Stage</span><span className="crm-adv-value">{row.procurement_stage?.trim() ? row.procurement_stage : "—"}</span></div>
+                                      <div className="crm-adv-item"><span className="crm-adv-label">Use Case</span><span className="crm-adv-value">{row.use_case?.trim() ? row.use_case : "—"}</span></div>
+                                      <div className="crm-adv-item"><span className="crm-adv-label">Decision Criteria</span><span className="crm-adv-value">{row.decision_criteria?.trim() ? row.decision_criteria : "—"}</span></div>
+                                      <div className="crm-adv-item"><span className="crm-adv-label">Budget Owner</span><span className="crm-adv-value">{row.budget_owner?.trim() ? row.budget_owner : "—"}</span></div>
+                                      <div className="crm-adv-item"><span className="crm-adv-label">Scope</span><span className="crm-adv-value">{row.implementation_scope?.trim() ? row.implementation_scope : "—"}</span></div>
                                     </div>
-                                  )}
+                                  </div>
                                   {(row.external_interaction_id ||
                                     (Array.isArray(row.participants) &&
                                       row.participants.length > 0)) && (
@@ -1916,7 +2257,7 @@ function App() {
                                         "crm-hubspot-btn" +
                                         (hsSynced ? " crm-hubspot-btn--synced" : "")
                                       }
-                                      onClick={() => pushToHubspot(row.id)}
+                                      onClick={() => openHubspotPreview(row.id)}
                                       disabled={Boolean(syncingByRecord[row.id])}
                                       aria-busy={Boolean(syncingByRecord[row.id])}
                                     >
@@ -2054,6 +2395,493 @@ function App() {
             )}
           </div>
         </main>
+
+        {hsPreviewOpen && hsPreviewData && (
+          <div className="crm-modal-overlay" onClick={closeHubspotPreview}>
+            <div
+              className="crm-modal crm-hubspot-preview-modal"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="crm-modal-close"
+                onClick={closeHubspotPreview}
+                aria-label="Close preview"
+              >
+                ✕
+              </button>
+
+              <div className="crm-modal-header">
+                <h2 className="crm-modal-title">Preview for HubSpot Sync</h2>
+                <p className="crm-modal-subtitle">
+                  Review and edit the data below before syncing to HubSpot.
+                  Changes are only applied to HubSpot, not to your local
+                  record.
+                </p>
+              </div>
+
+              <div className="crm-modal-body">
+                <div className="crm-preview-sections">
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">📊 Key Metrics</h3>
+                    <div className="crm-preview-grid">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Budget</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.budget ?? hsPreviewData.budget}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              budget: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Intent</label>
+                        <select
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.intent ?? hsPreviewData.intent}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              intent: e.target.value,
+                            })
+                          }
+                        >
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                        </select>
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Deal Score</label>
+                        <input
+                          type="number"
+                          className="crm-preview-input"
+                          value={
+                            hsPreviewEdits.deal_score ?? hsPreviewData.deal_score
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              deal_score: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Industry</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={
+                            hsPreviewEdits.industry ?? hsPreviewData.industry
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              industry: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Risk Level</label>
+                        <select
+                          className="crm-preview-input"
+                          value={
+                            hsPreviewEdits.risk_level ?? hsPreviewData.risk_level
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              risk_level: e.target.value,
+                            })
+                          }
+                        >
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                        </select>
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Product</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.product ?? hsPreviewData.product}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              product: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">
+                      🏢 Company & Procurement
+                    </h3>
+                    <div className="crm-preview-grid">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">
+                          Mentioned Company
+                        </label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={
+                            hsPreviewEdits.mentioned_company ??
+                            hsPreviewData.mentioned_company
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              mentioned_company: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">
+                          Procurement Stage
+                        </label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={
+                            hsPreviewEdits.procurement_stage ??
+                            hsPreviewData.procurement_stage
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              procurement_stage: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Use Case</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.use_case ?? hsPreviewData.use_case}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              use_case: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Budget Owner</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={
+                            hsPreviewEdits.budget_owner ??
+                            hsPreviewData.budget_owner
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              budget_owner: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">
+                          Implementation Scope
+                        </label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={
+                            hsPreviewEdits.implementation_scope ??
+                            hsPreviewData.implementation_scope
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              implementation_scope: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Timeline</label>
+                        <input
+                          type="text"
+                          className="crm-preview-input"
+                          value={hsPreviewEdits.timeline ?? hsPreviewData.timeline}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              timeline: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">
+                      💡 Strategic Information
+                    </h3>
+                    <div className="crm-preview-full-width">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">AI Summary</label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={hsPreviewEdits.summary ?? hsPreviewData.summary}
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              summary: e.target.value,
+                            })
+                          }
+                          rows="3"
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Next Action</label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={
+                            hsPreviewEdits.next_action ?? hsPreviewData.next_action
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              next_action: e.target.value,
+                            })
+                          }
+                          rows="2"
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Pain Points</label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={
+                            hsPreviewEdits.pain_points ?? hsPreviewData.pain_points
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              pain_points: e.target.value,
+                            })
+                          }
+                          rows="3"
+                        />
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">
+                          Decision Criteria
+                        </label>
+                        <textarea
+                          className="crm-preview-textarea"
+                          value={
+                            hsPreviewEdits.decision_criteria ??
+                            hsPreviewData.decision_criteria
+                          }
+                          onChange={(e) =>
+                            setHsPreviewEdits({
+                              ...hsPreviewEdits,
+                              decision_criteria: e.target.value,
+                            })
+                          }
+                          rows="3"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">🔗 CRM Links</h3>
+                    <div className="crm-preview-grid">
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Account ID</label>
+                        <div className="crm-preview-value">
+                          {hsPreviewData.account_id}
+                        </div>
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Contact ID</label>
+                        <div className="crm-preview-value">
+                          {hsPreviewData.contact_id}
+                        </div>
+                      </div>
+                      <div className="crm-preview-field">
+                        <label className="crm-preview-label">Deal ID</label>
+                        <div className="crm-preview-value">
+                          {hsPreviewData.deal_id}
+                        </div>
+                      </div>
+                    </div>
+                    <p className="crm-preview-readonly-note">
+                      These CRM links are display-only and cannot be edited.
+                    </p>
+                  </div>
+
+                  <div className="crm-preview-section">
+                    <h3 className="crm-preview-section-title">
+                      🏷️ Tags & Relationships
+                    </h3>
+                    <div className="crm-preview-tags-group">
+                      <label className="crm-preview-label">Tags</label>
+                      <div className="crm-preview-tags">
+                        {getPreviewList("tags").map((tag, i) => (
+                          <span key={i} className="crm-preview-tag">
+                            {tag}
+                            <button
+                              type="button"
+                              className="crm-preview-tag-remove"
+                              onClick={() => removePreviewListItem("tags", i)}
+                              aria-label={`Remove tag ${tag}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="crm-preview-tag-edit-row">
+                        <input
+                          type="text"
+                          className="crm-preview-tag-input"
+                          placeholder="Add tag"
+                          value={hsTagInput}
+                          onChange={(e) => setHsTagInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              addPreviewListItem("tags", hsTagInput);
+                              setHsTagInput("");
+                            }
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="crm-preview-tag-add"
+                          onClick={() => {
+                            addPreviewListItem("tags", hsTagInput);
+                            setHsTagInput("");
+                          }}
+                        >
+                          Add
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="crm-preview-tags-group">
+                      <label className="crm-preview-label">Stakeholders</label>
+                      <div className="crm-preview-tags">
+                        {getPreviewList("stakeholders").map((s, i) => (
+                          <span
+                            key={i}
+                            className="crm-preview-tag crm-preview-tag--stake"
+                          >
+                            {s}
+                            <button
+                              type="button"
+                              className="crm-preview-tag-remove"
+                              onClick={() => removePreviewListItem("stakeholders", i)}
+                              aria-label={`Remove stakeholder ${s}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="crm-preview-tag-edit-row">
+                        <input
+                          type="text"
+                          className="crm-preview-tag-input"
+                          placeholder="Add stakeholder"
+                          value={hsStakeholderInput}
+                          onChange={(e) => setHsStakeholderInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              addPreviewListItem("stakeholders", hsStakeholderInput);
+                              setHsStakeholderInput("");
+                            }
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="crm-preview-tag-add"
+                          onClick={() => {
+                            addPreviewListItem("stakeholders", hsStakeholderInput);
+                            setHsStakeholderInput("");
+                          }}
+                        >
+                          Add
+                        </button>
+                      </div>
+                    </div>
+
+                    {hsPreviewData.competitors?.length > 0 && (
+                      <div className="crm-preview-tags-group">
+                        <label className="crm-preview-label">Competitors</label>
+                        <div className="crm-preview-tags">
+                          {hsPreviewData.competitors.map((comp, i) => (
+                            <span
+                              key={i}
+                              className="crm-preview-tag crm-preview-tag--competitor"
+                            >
+                              {comp}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="crm-modal-footer">
+                <button
+                  type="button"
+                  className="crm-modal-btn crm-modal-btn--cancel"
+                  onClick={closeHubspotPreview}
+                  disabled={hsPreviewSyncing}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="crm-modal-btn crm-modal-btn--confirm"
+                  onClick={() => {
+                    setHsPreviewSyncing(true);
+                    pushToHubspot(hsPreviewRecordId);
+                  }}
+                  disabled={hsPreviewSyncing}
+                  aria-busy={hsPreviewSyncing}
+                >
+                  {hsPreviewSyncing ? (
+                    <span className="crm-modal-btn-inner">
+                      <Spinner size={12} />
+                      Syncing...
+                    </span>
+                  ) : (
+                    "✓ Confirm & Sync to HubSpot"
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

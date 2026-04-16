@@ -9,7 +9,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.utils.extraction_refine import infer_timeline_hint
+from app.utils.extraction_refine import (
+    infer_budget_hint,
+    infer_company_hint,
+    infer_industry_hint,
+    infer_product_hint,
+    infer_timeline_hint,
+)
 
 
 def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
@@ -38,31 +44,14 @@ def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
     if not t:
         return out
 
-    bm = re.search(
-        r"\bbudget\s+(?:is|of|around|about)?\s*[:\s]*([₹$€]?\s*[\d,.]+(?:\s*[kKmM])?)",
-        t,
-        re.I,
-    )
-    if bm:
-        out["budget"] = re.sub(r"\s+", " ", bm.group(1).strip())
-    else:
-        bm2 = re.search(
-            r"(?:₹|\$|€|inr|usd)\s*[\d,.]+|[\d]{1,3}(?:,\d{3})+(?:\.\d+)?|\b\d+\s*[kKmM]\b",
-            t,
-            re.I,
-        )
-        if bm2:
-            out["budget"] = bm2.group(0).strip()
+    b_hint = infer_budget_hint(t)
+    if b_hint:
+        out["budget"] = b_hint
 
-    fm = re.search(
-        r"\bfrom\s+([A-Z][a-zA-Z0-9&.'-]+(?:\s+[A-Z][a-zA-Z0-9&.'-]+)*)",
-        t,
-    )
-    if fm:
-        company = fm.group(1).strip()
-        if len(company) >= 2:
-            out["mentioned_company"] = company[:256]
-            out["custom_fields"]["mentioned_company"] = company[:256]
+    company = infer_company_hint(t)
+    if company:
+        out["mentioned_company"] = company[:256]
+        out["custom_fields"]["mentioned_company"] = company[:256]
 
     pm = re.search(
         r"\b(?:call|spoke|talked|meeting)\s+with\s+([A-Z][a-z]+)\s+from\b",
@@ -76,14 +65,56 @@ def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
     if th:
         out["timeline"] = th
 
+    p_hint = infer_product_hint(t)
+    if p_hint:
+        out["product"] = p_hint[:512]
+
+    i_hint = infer_industry_hint(t)
+    if i_hint:
+        out["industry"] = i_hint[:256]
+
+    pain_candidates: list[str] = []
+    m_issue = re.search(r"\b(?:biggest issue|biggest challenge|main challenge)\s+is\s+([^.]+)", t, re.I)
+    if m_issue:
+        pain_candidates.append(m_issue.group(1).strip(" .,:;"))
+    if re.search(r"\bmanual(?:ly)?\b", t, re.I):
+        pain_candidates.append("Manual CRM/call logging effort")
+    if re.search(r"\black of (?:clear )?view|visibility\b", t, re.I):
+        pain_candidates.append("Limited pipeline visibility")
+    if re.search(r"\breport(?:ing)?\b", t, re.I) and re.search(r"\b(?:time|slow|reliable|accuracy|accurate)\b", t, re.I):
+        pain_candidates.append("Reporting is slow and data reliability is poor")
+    if re.search(r"\bdifficult to manage|hard to manage|inefficient\b", t, re.I):
+        pain_candidates.append("Current workflow is difficult to manage efficiently")
+    if pain_candidates:
+        dedup = list(dict.fromkeys(pain_candidates))
+        out["pain_points"] = "; ".join(dedup)[:1024]
+
+    competitors: list[str] = []
     if re.search(r"\b(?:competitor|vs\.?|versus)\s+([A-Z][a-zA-Z]+)", t):
         cm = re.findall(r"\b(?:vs\.?|versus)\s+([A-Z][a-zA-Z0-9]+)", t)
-        out["competitors"] = list({c for c in cm if c})[:10]
+        competitors.extend([c for c in cm if c])
+    looked_into = re.findall(r"\blooked into\s+([A-Z][a-zA-Z0-9]+)", t, re.I)
+    competitors.extend([c for c in looked_into if c])
+    if competitors:
+        out["competitors"] = list(dict.fromkeys(competitors))[:10]
 
-    low = bool(re.search(r"\b(?:maybe|not sure|just looking|explor(?:e|ing))\b", t, re.I))
+    low = bool(
+        re.search(
+            r"\b(?:not sure|just looking|explor(?:e|ing)|can't afford|cannot afford|too expensive|no budget)\b",
+            t,
+            re.I,
+        )
+    )
     high = bool(
         re.search(
-            r"\b(?:purchase order|signed|ready to buy|send (?:the )?contract)\b",
+            r"\b(?:purchase order|signed|ready to buy|send (?:the )?contract|let'?s go ahead|use a visa|place this order|set this order up)\b",
+            t,
+            re.I,
+        )
+    )
+    medium = bool(
+        re.search(
+            r"\b(?:timeline|next quarter|next two months|head of sales|decision|stakeholder|demo|hubspot|integration|proposal|budget)\b",
             t,
             re.I,
         )
@@ -92,7 +123,7 @@ def heuristic_extract_entities(transcript: str) -> dict[str, Any]:
         out["intent"] = "high"
     elif low:
         out["intent"] = "low"
-    elif re.search(r"\b(?:budget|pricing|proposal|demo|pilot)\b", t, re.I):
+    elif medium or re.search(r"\b(?:budget|pricing|proposal|demo|pilot)\b", t, re.I):
         out["intent"] = "medium"
 
     return out

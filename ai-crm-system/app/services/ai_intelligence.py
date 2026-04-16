@@ -15,6 +15,8 @@ import re
 from typing import Any
 
 from app.utils.groq_retry import groq_chat_with_retry
+from app.utils.budget import parse_budget_to_int
+from app.utils.extraction_refine import infer_budget_hint, infer_product_hint
 
 logger = logging.getLogger(__name__)
 
@@ -69,16 +71,19 @@ def _llm_text(prompt: str) -> str:
 def classify_interaction(text: str) -> str:
     """Return exactly one of: sales, support, inquiry, complaint."""
     prompt = (
-        "You are a strict classifier. Read the conversation and classify it "
-        "into EXACTLY one category: sales, support, inquiry, complaint.\n\n"
-        "Rules:\n"
-        "- sales    = purchasing, pricing, proposals, deals, budget discussions\n"
-        "- support  = bugs, issues, broken features, how-to help\n"
-        "- inquiry  = general questions, info gathering, demos, evaluations\n"
-        "- complaint = frustration, escalation, dissatisfaction, threats to leave\n\n"
-        'Return ONLY valid JSON: {"classification": "<category>"}\n'
-        "No commentary. No extra keys.\n\n"
-        f"Text:\n{text[:8000]}"
+        "Classify the conversation into EXACTLY one label: sales, support, inquiry, complaint.\n"
+        "The transcript may come from Whisper ASR and contain noise.\n\n"
+        "Decision rubric:\n"
+        "- complaint: explicit dissatisfaction, escalation, refund/cancel threats, legal tone.\n"
+        "- support: troubleshooting, break/fix, bug/error, technical help requests.\n"
+        "- sales: pricing, proposal, procurement, contract, budget, purchase intent.\n"
+        "- inquiry: informational discussion without clear support issue or buying motion.\n\n"
+        "Tie-break order when multiple labels appear: complaint > support > sales > inquiry.\n"
+        "Use strongest dominant intent in the latest part of the conversation.\n"
+        "Ignore filler words and transcription artifacts.\n\n"
+        'Return ONLY JSON: {"classification": "sales|support|inquiry|complaint"}\n'
+        "No extra keys. No explanation.\n\n"
+        f"Conversation:\n{text[:8000]}"
     )
     data = _llm_json(prompt)
     if data:
@@ -113,8 +118,8 @@ def score_deal(record: dict[str, Any]) -> int:
     """
     score = 0
 
-    budget = str(record.get("budget", "")).strip()
-    if budget and budget not in ("0", ""):
+    budget = parse_budget_to_int(str(record.get("budget", "")).strip())
+    if budget > 0:
         score += 20
 
     intent = str(record.get("intent", "")).lower()
@@ -148,20 +153,26 @@ def score_deal(record: dict[str, Any]) -> int:
 def generate_next_action(text: str) -> str:
     """Return a short actionable next step (max 12 words)."""
     prompt = (
-        "Read the conversation below and suggest ONE concise next action "
-        "for the sales or support team.\n\n"
-        "RULES:\n"
-        "- Maximum 12 words\n"
-        "- Must be actionable (start with a verb)\n"
-        "- No JSON, no bullet points, no quotes\n"
-        "- Return ONLY the action text\n\n"
-        f"Text:\n{text[:6000]}"
+        "Suggest ONE highest-impact next action for the internal team.\n"
+        "The transcript may be noisy ASR text.\n\n"
+        "Rules:\n"
+        "- Maximum 12 words.\n"
+        "- Start with an imperative verb (e.g., Schedule, Send, Confirm, Escalate).\n"
+        "- Must be concrete and directly grounded in the conversation outcome.\n"
+        "- If no clear action is stated, output: \"Follow up to clarify next steps\"\n"
+        "- Output plain text only. No quotes, bullets, or JSON.\n\n"
+        f"Conversation:\n{text[:6000]}"
     )
     action = _llm_text(prompt)
     if action:
         action = action.strip('"\'.')
         words = action.split()
         return " ".join(words[:12])
+    lower = text.lower()
+    if "demo" in lower and ("next week" in lower or "early next week" in lower):
+        return "Schedule detailed demo with stakeholders early next week"
+    if "follow up" in lower:
+        return "Send follow-up with proposed times and required attendees"
     return "Follow up with the contact"
 
 
@@ -172,13 +183,19 @@ def generate_next_action(text: str) -> str:
 def detect_risk(text: str) -> dict[str, str]:
     """Return {risk_level: low|medium|high, reason: '...'}."""
     prompt = (
-        "Analyze the conversation for deal or customer risk.\n\n"
-        "Risk factors: competitor mentions, budget objections, delays, "
-        "complaints, negative sentiment, missing decision-maker, "
-        "churn signals, legal threats.\n\n"
-        'Return ONLY valid JSON: {"risk_level": "low|medium|high", "reason": "short explanation"}\n'
-        "No extra keys. No commentary.\n\n"
-        f"Text:\n{text[:6000]}"
+        "Assess deal/customer risk from the conversation.\n"
+        "Treat the transcript as noisy ASR and focus on clear signals.\n\n"
+        "Risk scale:\n"
+        "- high: churn/cancel threat, legal escalation, severe dissatisfaction, hard blocker.\n"
+        "- medium: competitor pressure, budget pushback, timeline slippage, unclear ownership.\n"
+        "- low: cooperative tone with no significant blockers.\n\n"
+        "Reason requirements:\n"
+        "- 8-20 words.\n"
+        "- Mention the strongest explicit signal from the conversation.\n"
+        "- Do not invent facts.\n\n"
+        'Return ONLY JSON: {"risk_level": "low|medium|high", "reason": "..." }\n'
+        "No extra keys. No markdown.\n\n"
+        f"Conversation:\n{text[:6000]}"
     )
     data = _llm_json(prompt)
     if data:
@@ -188,10 +205,25 @@ def detect_risk(text: str) -> dict[str, str]:
             return {"risk_level": level, "reason": reason[:512]}
 
     lower = text.lower()
+    budget_pushback = any(
+        w in lower for w in ("not sure i can afford", "can't afford", "cannot afford", "too expensive", "budget concern")
+    )
+    purchase_signal = any(
+        w in lower for w in ("let's go ahead", "use a visa", "place this order", "credit card", "purchase today")
+    )
     if any(w in lower for w in ("cancel", "leave", "terrible", "worst", "lawsuit", "unacceptable")):
         return {"risk_level": "high", "reason": "Negative sentiment detected"}
-    if any(w in lower for w in ("competitor", "alternative", "delay", "budget concern", "expensive")):
-        return {"risk_level": "medium", "reason": "Potential churn signals detected"}
+    if budget_pushback and purchase_signal:
+        return {"risk_level": "medium", "reason": "Budget hesitation surfaced despite later purchase intent"}
+    competitor_pressure = any(
+        w in lower
+        for w in ("competitor", "alternative", "salesforce", "other tools", "other vendors", "evaluating")
+    )
+    timeline_risk = any(w in lower for w in ("implementation time", "takes too long", "go live"))
+    if budget_pushback or competitor_pressure or timeline_risk:
+        return {"risk_level": "medium", "reason": "Potential objection or churn signal detected"}
+    if purchase_signal:
+        return {"risk_level": "low", "reason": "Positive buying intent and checkout progression"}
     return {"risk_level": "low", "reason": "No significant risk signals"}
 
 
@@ -199,18 +231,100 @@ def detect_risk(text: str) -> dict[str, str]:
 # 5. generate_summary — 2 concise lines
 # ---------------------------------------------------------------------------
 
-def generate_summary(text: str) -> str:
-    """Return a 2-line concise summary."""
+def generate_summary(text: str, extracted: dict[str, Any] | None = None) -> str:
+    """Return a concise 2-3 sentence summary."""
     prompt = (
-        "Summarize this conversation in exactly 2 concise sentences.\n\n"
-        "Focus on:\n"
-        "1. What the customer needs or discussed\n"
-        "2. Key outcome or decision\n\n"
-        "Return ONLY the 2 sentences. No labels, no JSON.\n\n"
-        f"Text:\n{text[:8000]}"
+        "Summarize the conversation in 2-3 concise sentences.\n"
+        "Transcript may contain ASR noise; infer meaning conservatively.\n\n"
+        "Sentence 1: who is involved and what they need/issue.\n"
+        "Sentence 2: current decision status, risk, and explicit next step.\n"
+        "Sentence 3 (optional): buying context such as timeline, budget, or stakeholders.\n"
+        "Use factual language only from the conversation.\n"
+        "No headings, no bullets, no JSON.\n\n"
+        f"Conversation:\n{text[:8000]}"
     )
     summary = _llm_text(prompt)
-    return summary[:1024] if summary else "No summary available."
+    if summary and len(summary.split()) >= 10:
+        # Normalize common ASR-inflated price mentions in summaries for map-update calls.
+        hint_budget = infer_budget_hint(text)
+        if hint_budget:
+            summary = re.sub(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})+)", lambda m: f"${hint_budget}" if "," in m.group(1) else m.group(0), summary)
+        # Keep summary compact and at most three sentences.
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", summary) if p.strip()]
+        if len(parts) >= 2:
+            return " ".join(parts[:3])[:1024]
+        return summary[:1024]
+
+    # Deterministic fallback to avoid poor summaries when LLM is unavailable/rate-limited.
+    low = text.lower()
+    ex = extracted if isinstance(extracted, dict) else {}
+    company = str(ex.get("mentioned_company") or "").strip()
+    product = str(ex.get("product") or "").strip() or infer_product_hint(text) or "requested product/service"
+    budget = infer_budget_hint(text)
+    if not budget:
+        b2 = str(ex.get("budget") or "").strip()
+        budget = b2 if b2 else None
+    timeline = str(ex.get("timeline") or "").strip()
+    next_step = str(ex.get("next_step") or "").strip()
+    competitors = ex.get("competitors") if isinstance(ex.get("competitors"), list) else []
+    pain_points = str(ex.get("pain_points") or "").strip()
+    vehicle = ""
+    vm = re.search(r"\b(20\d{2}|19\d{2})\s+([A-Z][a-zA-Z]+)\s+([A-Z][a-zA-Z0-9]+)\b", text)
+    if vm:
+        vehicle = f"{vm.group(1)} {vm.group(2)} {vm.group(3)}"
+    version = ""
+    ver = re.search(r"\bversion\s+([0-9]+(?:\.[0-9]+)*)\b", low)
+    if ver:
+        version = ver.group(1)
+
+    affordability = any(
+        x in low for x in ("can't afford", "cannot afford", "not really sure if i can afford", "too expensive")
+    )
+    close_signal = any(
+        x in low for x in ("let's go ahead", "use a visa", "credit card", "place this order", "set this order up")
+    )
+
+    s1_parts = []
+    if company:
+        s1_parts.append(f"{company} discusses")
+    else:
+        s1_parts.append("Prospect discusses")
+    s1_parts.append(product)
+    if vehicle:
+        s1_parts.append(f"for a {vehicle}")
+    if version:
+        s1_parts.append(f"and discusses version {version}")
+    if budget:
+        s1_parts.append(f"with budget around {budget}")
+    s1 = " ".join(s1_parts).strip()
+    s1 = re.sub(r"\s+", " ", s1).rstrip(" .") + "."
+
+    if affordability and close_signal:
+        s2 = "Customer raises affordability concerns but proceeds to place the order by card."
+    elif close_signal:
+        s2 = "Conversation progresses to checkout with payment details and immediate fulfillment discussed."
+    elif affordability:
+        s2 = "Conversation surfaces affordability concerns and needs follow-up before purchase confirmation."
+    elif next_step:
+        s2 = f"Next step is {next_step.lower().strip('.')}."
+    elif "demo" in low and "next week" in low:
+        s2 = "Next step is a detailed demo with the team early next week."
+    elif timeline:
+        s2 = f"Target timeline is {timeline.lower().strip('.')} with evaluation in progress."
+    elif competitors:
+        s2 = "Prospect is comparing alternatives and requires stronger differentiation."
+    else:
+        s2 = "Conversation captures pricing and support details with follow-up pending confirmation."
+    s3 = ""
+    if timeline:
+        s3 = f"Expected implementation timeline is {timeline.lower().strip('.')}."
+    elif pain_points:
+        s3 = f"Key pain points include {pain_points.lower().strip('.')}."
+    elif competitors:
+        s3 = f"Competitor context includes {', '.join(str(c) for c in competitors[:2])}."
+
+    joined = f"{s1} {s2}" if not s3 else f"{s1} {s2} {s3}"
+    return joined[:1024]
 
 
 # ---------------------------------------------------------------------------
@@ -220,34 +334,66 @@ def generate_summary(text: str) -> str:
 def auto_tag(text: str) -> list[str]:
     """Return a list of relevant CRM tags (max 8)."""
     prompt = (
-        "Analyze the conversation and return relevant CRM tags.\n\n"
-        'Return ONLY valid JSON: {"tags": ["tag1", "tag2"]}\n'
-        "Possible tags: urgent, enterprise, small-business, follow-up, "
-        "demo-request, pricing, technical, renewal, upsell, new-lead, "
-        "escalation, decision-maker, budget-approved, competitor-mentioned.\n"
-        "Only include tags that genuinely apply. Max 8 tags.\n"
+        "Extract CRM tags from the conversation.\n\n"
+        "Allowed tags only:\n"
+        "urgent, enterprise, small-business, follow-up, demo-request, pricing, technical,\n"
+        "renewal, upsell, new-lead, escalation, decision-maker, budget-approved, competitor-mentioned.\n\n"
+        "Rules:\n"
+        "- Include all applicable tags directly supported by explicit evidence.\n"
+        "- No synonyms or custom tags.\n"
+        "- Deduplicate tags.\n"
+        "- Max 8 tags.\n\n"
+        'Return ONLY JSON: {"tags": ["tag1", "tag2"]}\n'
         "No extra keys.\n\n"
-        f"Text:\n{text[:6000]}"
+        f"Conversation:\n{text[:6000]}"
     )
     data = _llm_json(prompt)
     if data:
         tags = data.get("tags", [])
         if isinstance(tags, list):
-            return [str(t).strip().lower() for t in tags if str(t).strip()][:8]
+            cleaned = [str(t).strip().lower() for t in tags if str(t).strip()][:8]
+            if cleaned:
+                return cleaned
 
     tags: list[str] = []
     lower = text.lower()
-    if any(w in lower for w in ("urgent", "asap", "immediately")):
+    if any(w in lower for w in ("urgent", "asap", "immediately", "today", "right away")):
         tags.append("urgent")
     if any(w in lower for w in ("enterprise", "large-scale", "company-wide")):
         tags.append("enterprise")
+    if any(w in lower for w in ("small business", "startup", "small team")):
+        tags.append("small-business")
     if any(w in lower for w in ("demo", "demonstration", "trial")):
         tags.append("demo-request")
     if any(w in lower for w in ("price", "pricing", "cost", "quote")):
         tags.append("pricing")
+    if any(w in lower for w in ("follow up", "follow-up", "call back", "check back")):
+        tags.append("follow-up")
+    if any(w in lower for w in ("technical", "bug", "issue", "integration", "api")):
+        tags.append("technical")
+    if any(w in lower for w in ("map update", "navigation", "version")):
+        tags.append("technical")
+    if any(w in lower for w in ("renew", "renewal", "contract extension")):
+        tags.append("renewal")
+    if any(w in lower for w in ("upsell", "upgrade", "add-on", "additional seats")):
+        tags.append("upsell")
+    if any(w in lower for w in ("new lead", "first call", "new prospect")):
+        tags.append("new-lead")
+    if any(w in lower for w in ("escalat", "complaint", "unacceptable", "angry")):
+        tags.append("escalation")
+    if any(w in lower for w in ("ceo", "cto", "cfo", "director", "vp", "head of", "decision maker")):
+        tags.append("decision-maker")
+    if any(w in lower for w in ("budget approved", "approved budget", "budget signoff", "budget signed off")):
+        tags.append("budget-approved")
+    if any(w in lower for w in ("use a visa", "credit card", "place this order", "set this order up")):
+        tags.append("budget-approved")
     if any(w in lower for w in ("competitor", "alternative")):
         tags.append("competitor-mentioned")
-    return tags or ["general"]
+    deduped: list[str] = []
+    for t in tags:
+        if t not in deduped:
+            deduped.append(t)
+    return deduped[:8] or ["general"]
 
 
 # ---------------------------------------------------------------------------
@@ -342,10 +488,13 @@ def generate_email_draft(record: dict[str, Any]) -> str:
     context_str = "\n".join(context_parts) if context_parts else "General inquiry"
 
     prompt = (
-        "Write a short, professional follow-up email (3-5 sentences) based on "
-        "the CRM record context below. Be warm but concise. "
-        "Include a clear call to action. Return ONLY the email body text.\n\n"
-        f"Context:\n{context_str}"
+        "Write a professional follow-up email body in 3-5 sentences.\n"
+        "Use only the provided CRM context. Do not invent missing details.\n"
+        "Tone: helpful, concise, business-friendly.\n"
+        "Include one clear CTA in the final sentence.\n"
+        "Do not include subject line, greeting, signature, bullets, or placeholders.\n"
+        "Return only email body text.\n\n"
+        f"CRM context:\n{context_str}"
     )
     draft = _llm_text(prompt)
     if draft:
@@ -374,7 +523,7 @@ def run_ai_intelligence(
     interaction_type = classify_interaction(text)
     deal_score_val = score_deal(normalized)
     risk = detect_risk(text)
-    summary = generate_summary(text)
+    summary = generate_summary(text, normalized)
     tags = auto_tag(text)
     next_action = generate_next_action(text)
 

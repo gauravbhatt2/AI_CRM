@@ -34,7 +34,18 @@ _receiver = TranscriptReceiver()
 
 
 def _transcript_with_speaker_labels(structured: StructuredTranscript, fallback: str) -> str:
-    """Build readable lines like 'Sales: …' / 'Customer: …' from labeled segments."""
+    """Build readable lines like '[00:05-00:09] Sales: ...' from labeled segments."""
+    def _fmt_ts(sec: float | int | None) -> str:
+        try:
+            s = max(0, int(float(sec or 0)))
+        except (TypeError, ValueError):
+            s = 0
+        m, r = divmod(s, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{r:02d}"
+        return f"{m:02d}:{r:02d}"
+
     segs = structured.segments or []
     if not segs:
         return fallback
@@ -44,7 +55,10 @@ def _transcript_with_speaker_labels(structured: StructuredTranscript, fallback: 
         if not t:
             continue
         sp = (seg.speaker or "").strip()
-        lines.append(f"{sp}: {t}" if sp else t)
+        start = _fmt_ts(getattr(seg, "start", 0.0))
+        end = _fmt_ts(getattr(seg, "end", 0.0))
+        prefix = f"[{start}-{end}]"
+        lines.append(f"{prefix} {sp}: {t}" if sp else f"{prefix} {t}")
     return "\n".join(lines) if lines else fallback
 
 

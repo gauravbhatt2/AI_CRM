@@ -10,65 +10,64 @@ from typing import Any
 # Extraction prompt — strict 17-field CRM schema
 # ---------------------------------------------------------------------------
 
-EXTRACTION_PROMPT_TEMPLATE = """You are a CRM data extraction engine. Your ONLY job is to read the
-conversation below and return a single flat JSON object with exactly the keys listed. Nothing else.
+EXTRACTION_PROMPT_TEMPLATE = """You are a precision CRM extraction engine for noisy Whisper transcripts.
+Read the conversation carefully and return ONE flat JSON object with exactly the 17 keys listed.
 
-═══════════════════════════════════════════════════════════════════════════════
-HARD RULES — FOLLOW EVERY ONE
-═══════════════════════════════════════════════════════════════════════════════
-1. Return STRICT JSON only. No markdown fences, no explanations, no extra text.
-2. DO NOT hallucinate. If information is NOT in the text → return null for that field.
-3. Never invent names, companies, numbers, or dates that are not explicitly stated.
-4. Every key below MUST appear in your output. Use null when the value is unknown.
-5. No extra keys beyond the 17 listed below.
+ABSOLUTE RULES:
+1) Return STRICT JSON only. No markdown, no prose, no code fences.
+2) Use only evidence from the conversation. Never infer facts that are not stated.
+3) If a field is missing, ambiguous, or conflicting, return null (or [] for array fields).
+4) Include every required key exactly once. Do not add extra keys.
+5) Keep values concise and CRM-ready (short phrases, not paragraphs).
 
-═══════════════════════════════════════════════════════════════════════════════
-BUDGET RULES
-═══════════════════════════════════════════════════════════════════════════════
-• Always return an integer (no currency symbols, no commas, no strings).
-  "$75,000" → 75000  |  "50k" → 50000  |  "$1.2M" → 1200000
-• If only a vague range like "six figures" → estimate the midpoint as an integer.
-• If NO budget is mentioned at all → null.
+CONFIDENCE AND EVIDENCE:
+- Prefer precision over coverage: leave unknown fields null.
+- Do not invent names, titles, companies, numbers, dates, or stages.
+- If multiple possibilities exist and no clear winner is stated, return null.
 
-═══════════════════════════════════════════════════════════════════════════════
-INTENT RULES
-═══════════════════════════════════════════════════════════════════════════════
-Return EXACTLY one of these three strings (lowercase):
-  "high"   → strong buying intent, clear commitment, ready to purchase
-  "medium" → evaluating, comparing options, asking for proposals
-  "low"    → exploratory, no urgency, just gathering info
-If uncertain, lean toward "medium". Never return any other value.
+WHISPER / ASR HANDLING:
+- Transcript may contain filler words, minor transcription errors, and missing punctuation.
+- Normalize obvious ASR noise before extraction (e.g., repeated words, disfluencies).
+- Use context from surrounding lines to resolve entity boundaries.
+- If speaker labels or timestamps appear, use them as context only; do not copy timestamps into values.
+- Never include trailing connector words in entities (e.g., "Novagen is" must become "Novagen").
 
-═══════════════════════════════════════════════════════════════════════════════
-TIMELINE RULES (CRITICAL)
-═══════════════════════════════════════════════════════════════════════════════
-Extract ONLY the decision or implementation timeline.
-IGNORE logistics / shipping / delivery phrases:
-  ✗ "ship today" ✗ "send tomorrow" ✗ "deliver next week" ✗ "mail the invoice"
-Valid examples:
-  ✓ "we plan to implement next quarter"
-  ✓ "decision by end of month"
-  ✓ "need this live before Q3"
-If no decision/implementation timeline exists → null.
+FIELD RULES:
+- budget:
+  - Return integer only (no symbols, commas, words).
+  - Valid conversions: "$75,000" -> 75000, "50k" -> 50000, "1.2M" -> 1200000.
+  - If plain currency amount appears (e.g., "$99", "99 dollars"), keep exact value (99).
+  - For consumer automotive map-update calls, if ASR produces "$99,000" but nearby context includes promotions like "$50 off" and shipping/tax, normalize to 99.
+  - If only vague wording exists (e.g., "six figures", "large budget"), return null.
+- intent:
+  - Must be exactly one of "high", "medium", "low".
+  - high = clear commitment or purchase readiness.
+  - medium = active evaluation/comparison with next steps.
+  - low = exploratory discussion with no urgency/commitment.
+  - If unclear, use "medium".
+- timeline:
+  - Capture only decision/implementation timeline.
+  - Ignore shipping/delivery/admin scheduling.
+  - If absent, return null.
+- product and product_version:
+  - product = clean product/service name only.
+  - product_version = version only (examples: "7.7", "2024.1"), else null.
+  - Never place version text inside product.
+- competitors:
+  - Array of competitor company names only.
+  - Normalize casing to proper names and deduplicate.
+- stakeholders:
+  - Array of names or role titles involved in decision/approval.
+  - Prefer "Name (Role)" when both are present.
+  - Do not include generic words like "team" unless explicitly the only reference.
+- next_step:
+  - Must be a concrete agreed action (meeting, demo, proposal, follow-up), not a wish.
+- procurement_stage:
+  - Use only if clearly stated/implied by explicit evidence (e.g., "evaluation", "negotiation", "legal review", "budget approved").
+  - Otherwise null.
 
-═══════════════════════════════════════════════════════════════════════════════
-PRODUCT + VERSION SEPARATION
-═══════════════════════════════════════════════════════════════════════════════
-"product" = clean product or service name (human-readable, CRM-friendly).
-"product_version" = version number only (e.g. "7.7", "2024.1"), or null.
-Example: "map update version 7.7" → product: "map update", product_version: "7.7"
-Never put a version number inside the product field.
-
-═══════════════════════════════════════════════════════════════════════════════
-COMPETITOR RULES
-═══════════════════════════════════════════════════════════════════════════════
-• Normalize to official company names. "SF" or "salesforce" → "Salesforce".
-• Deduplicate — no repeats in the array.
-
-═══════════════════════════════════════════════════════════════════════════════
-OUTPUT FORMAT — exactly these 17 keys, nothing more
-═══════════════════════════════════════════════════════════════════════════════
-{{
+OUTPUT SCHEMA (EXACT KEYS ONLY):
+{
   "budget": null,
   "intent": "medium",
   "timeline": null,
@@ -86,26 +85,26 @@ OUTPUT FORMAT — exactly these 17 keys, nothing more
   "decision_criteria": null,
   "budget_owner": null,
   "implementation_scope": null
-}}
+}
 
 Field definitions:
-  budget              — integer or null
-  intent              — "high" | "medium" | "low"
-  timeline            — decision/implementation timeline phrase, or null
-  product             — clean product/service name, or null
-  product_version     — version string, or null
-  competitors         — array of normalized competitor names
-  industry            — industry vertical string, or null
-  pain_points         — customer problems/frustrations as a single string, or null
-  next_step           — agreed-upon next step, or null
-  urgency_reason      — why time-sensitive, or null
-  stakeholders        — array of names/roles involved in the decision
-  mentioned_company   — company the customer represents, or null
-  procurement_stage   — e.g. "evaluation", "negotiation", "budget approved", or null
-  use_case            — what the customer intends to use the product for, or null
-  decision_criteria   — what matters most (price, features, support…), or null
-  budget_owner        — person who controls the budget, or null
-  implementation_scope — rollout scope (e.g. "company-wide", "regional", "pilot"), or null
+  budget               -> integer or null
+  intent               -> "high" | "medium" | "low"
+  timeline             -> decision/implementation timeline phrase, or null
+  product              -> product/service name, or null
+  product_version      -> version string, or null
+  competitors          -> array of competitor names
+  industry             -> industry vertical, or null
+  pain_points          -> main customer problems, single concise string, or null
+  next_step            -> concrete agreed next action, or null
+  urgency_reason       -> reason for urgency/time pressure, or null
+  stakeholders         -> array of decision participants (names/roles; use "Name (Role)" when possible)
+  mentioned_company    -> customer company name, or null
+  procurement_stage    -> buying stage, or null
+  use_case             -> intended usage, or null
+  decision_criteria    -> key evaluation criteria, or null
+  budget_owner         -> person/role controlling budget, or null
+  implementation_scope -> rollout scope, or null
 
 Conversation:
 {transcript}"""

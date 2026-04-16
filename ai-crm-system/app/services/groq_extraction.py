@@ -17,6 +17,9 @@ from app.core.config import settings
 from app.services.groq_llm import get_groq_client
 from app.utils.groq_retry import groq_chat_with_retry
 from app.utils.extraction_refine import (
+    refine_budget_core_field,
+    refine_company_core_field,
+    refine_product_industry_fields,
     enrich_map_version_custom_field,
     refine_product_core_field,
     refine_timeline_core_field,
@@ -201,7 +204,7 @@ def _normalize(data: Any) -> dict[str, Any]:
         return out
 
     out["budget"] = _coerce_budget(data.get("budget"))
-    out["intent"] = _coerce_intent(data.get("intent"))
+    out["intent"] = _coerce_intent(data.get("intent")) or "medium"
     out["product"] = str(data.get("product") or "").strip()
     out["product_version"] = str(data.get("product_version") or "").strip()
     out["timeline"] = str(data.get("timeline") or "").strip()
@@ -329,6 +332,11 @@ def execute_groq_json_extraction(
 
     heur = heuristic_extract_entities(src_early)
     merged = merge_extraction_prefer_llm(llm_out, heur)
+    refine_budget_core_field(merged, src_early)
+    if not str(merged.get("intent") or "").strip():
+        merged["intent"] = "medium"
+    refine_company_core_field(merged, src_early)
+    refine_product_industry_fields(merged, src_early)
     refine_product_core_field(merged, src_early)
     refine_timeline_core_field(merged, src_early)
     enrich_map_version_custom_field(merged, src_early)
