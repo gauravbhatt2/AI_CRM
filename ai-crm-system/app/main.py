@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import analytics, crm, extraction, health, hubspot, ingestion, interactions
+from app.api.routes import analytics, crm, extraction, health, hubspot, ingestion, interactions, google_workspace
 from app.core.config import settings
 from app.db.database import init_db, init_engine
 
@@ -36,6 +36,7 @@ def create_app() -> FastAPI:
     application.include_router(analytics.router, prefix=settings.api_v1_prefix)
     application.include_router(interactions.router, prefix=settings.api_v1_prefix)
     application.include_router(hubspot.router, prefix=settings.api_v1_prefix)
+    application.include_router(google_workspace.router, prefix=settings.api_v1_prefix + "/google")
     return application
 
 

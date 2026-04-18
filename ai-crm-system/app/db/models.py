@@ -157,3 +157,18 @@ class AuditLog(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+class OAuthCredential(Base):
+    """Stores Google OAuth credentials for users/system."""
+
+    __tablename__ = "oauth_credentials"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_identifier: Mapped[str] = mapped_column(String(256), unique=True, index=True, nullable=False, default="global_system_user")
+    token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    client_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    client_secret: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    scopes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extracted_email: Mapped[str | None] = mapped_column(String(256), nullable=True)

@@ -1,3 +1,7 @@
+import GoogleConnect from './components/GoogleConnect';
+import EmailComposer from './components/EmailComposer';
+import ScheduleReminder from './components/ScheduleReminder';
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bar,
@@ -159,16 +163,16 @@ function describeCrmMappingMethod(method) {
 
 /* ── Design tokens (mirrored in JS for runtime badge colours) ── */
 const INTENT_COLORS = {
-  sales:     { bg: "#dbeafe", color: "#1d4ed8", border: "#93c5fd" },
-  support:   { bg: "#fef9c3", color: "#854d0e", border: "#fde047" },
-  inquiry:   { bg: "#ede9fe", color: "#5b21b6", border: "#c4b5fd" },
+  sales: { bg: "#dbeafe", color: "#1d4ed8", border: "#93c5fd" },
+  support: { bg: "#fef9c3", color: "#854d0e", border: "#fde047" },
+  inquiry: { bg: "#ede9fe", color: "#5b21b6", border: "#c4b5fd" },
   complaint: { bg: "#fee2e2", color: "#991b1b", border: "#fca5a5" },
 };
 
 const RISK_CONFIG = {
-  high:   { color: "#dc2626", bg: "#fee2e2", icon: "⚠", label: "High"   },
+  high: { color: "#dc2626", bg: "#fee2e2", icon: "⚠", label: "High" },
   medium: { color: "#d97706", bg: "#fef3c7", icon: "◉", label: "Medium" },
-  low:    { color: "#16a34a", bg: "#f0fdf4", icon: "✓", label: "Low"    },
+  low: { color: "#16a34a", bg: "#f0fdf4", icon: "✓", label: "Low" },
 };
 
 const PIE_COLORS = ["#6366f1", "#f59e0b", "#22c55e", "#ef4444", "#3b82f6", "#ec4899"];
@@ -1199,12 +1203,12 @@ function App() {
           </div>
           <nav className="crm-nav">
             {[
-              ["dashboard",    "🏠", "Dashboard"],
+              ["dashboard", "🏠", "Dashboard"],
               ["intelligence", "🧠", "AI Intelligence"],
-              ["timeline",     "⏱",  "Timeline"],
-              ["upload",       "⬆",  "Upload"],
-              ["analytics",    "📊", "Analytics"],
-              ["records",      "📋", "CRM Records"],
+              ["timeline", "⏱", "Timeline"],
+              ["upload", "⬆", "Upload"],
+              ["analytics", "📊", "Analytics"],
+              ["records", "📋", "CRM Records"],
             ].map(([id, icon, label]) => (
               <button
                 key={id}
@@ -1228,6 +1232,13 @@ function App() {
                 <div className="crm-page-head">
                   <h1 className="crm-page-title">Dashboard</h1>
                   <p className="crm-page-desc">Live snapshot of ingested interactions and AI-parsed revenue signals.</p>
+                </div>
+
+                {/* ── Google Integrations ── */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '20px', marginBottom: '24px' }}>
+                  <GoogleConnect />
+                  <EmailComposer contactId={1} dealId={1} />
+                  <ScheduleReminder contactId={1} dealId={1} />
                 </div>
 
                 {/* ── Stats row ── */}
@@ -1295,10 +1306,10 @@ function App() {
                   )}
                   <div className="crm-dash-actions">
                     {[
-                      ["upload",       "⬆ New upload"],
-                      ["timeline",     "⏱ Timeline"],
-                      ["analytics",    "📊 Analytics"],
-                      ["records",      "📋 Records"],
+                      ["upload", "⬆ New upload"],
+                      ["timeline", "⏱ Timeline"],
+                      ["analytics", "📊 Analytics"],
+                      ["records", "📋 Records"],
                       ["intelligence", "🧠 AI Intelligence"],
                     ].map(([id, label]) => (
                       <button key={id} type="button"

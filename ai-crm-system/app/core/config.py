@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
         "http://localhost:4173",
         "http://127.0.0.1:4173",
     ]
@@ -56,6 +58,11 @@ class Settings(BaseSettings):
     # Leave HUBSPOT_DEAL_STAGE_ID empty to auto-pick the first stage of that pipeline via the API.
     hubspot_pipeline_id: str = "default"
     hubspot_deal_stage_id: str = ""
+    
+    # Google Auth Settings
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+    google_redirect_uri: str | None = None
 
 
 @lru_cache
