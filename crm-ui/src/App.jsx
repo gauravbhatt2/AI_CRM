@@ -278,6 +278,9 @@ function App() {
   const [meetingModalVisible, setMeetingModalVisible] = useState(false);
   const [meetingModalRecord, setMeetingModalRecord] = useState(null);
 
+  // Dashboard task sort
+  const [dashTaskSort, setDashTaskSort] = useState("risk");
+
   const [insightsData, setInsightsData] = useState(null);
   const [insightsLoading, setInsightsLoading] = useState(true);
   const [insightsError, setInsightsError] = useState(null);
@@ -1375,6 +1378,106 @@ function App() {
                     ))}
                   </div>
                 </div>
+
+                {/* ── Task list card ── */}
+                {!crmRecordsLoading && crmRecords && crmRecords.length > 0 && (() => {
+                  const RISK_RANK = { high: 1, medium: 2, low: 3 };
+                  const INTENT_RANK = { high: 1, medium: 2, low: 3 };
+
+                  // Parse a free-text timeline string into approximate days (lower = more urgent)
+                  const timelineToDays = (str) => {
+                    if (!str) return 99999; // null/undefined → absolute last
+                    const s = str.toLowerCase().trim();
+                    if (!s || s === "—" || s === "-" || s === "n/a" || s === "none" || s === "null") return 99999;
+                    if (/immediately|asap|urgent|right away|today/.test(s)) return 1;
+                    if (/this week|within a week|one week|1 week|seven days|7 days/.test(s)) return 7;
+                    if (/live to seven|next.{0,5}seven|within seven/.test(s)) return 7;
+                    if (/two weeks|2 weeks|couple of weeks|next two weeks|14 days/.test(s)) return 14;
+                    if (/three weeks|3 weeks/.test(s)) return 21;
+                    if (/this month|within a month|one month|1 month|30 days/.test(s)) return 30;
+                    if (/next month|two months|2 months|60 days/.test(s)) return 60;
+                    if (/three months|3 months|quarter|next quarter|90 days/.test(s)) return 90;
+                    if (/four months|4 months/.test(s)) return 120;
+                    if (/six months|6 months|half year/.test(s)) return 180;
+                    if (/year|12 months/.test(s)) return 365;
+                    return 9998; // unrecognised text → second-to-last (before empty)
+                  };
+
+                  const sorted = [...crmRecords].sort((a, b) => {
+                    if (dashTaskSort === "risk") {
+                      return (RISK_RANK[a.risk_level] ?? 99) - (RISK_RANK[b.risk_level] ?? 99);
+                    }
+                    if (dashTaskSort === "intent") {
+                      return (INTENT_RANK[(a.intent || "").toLowerCase()] ?? 99) - (INTENT_RANK[(b.intent || "").toLowerCase()] ?? 99);
+                    }
+                    if (dashTaskSort === "timeline") {
+                      const da = timelineToDays(a.timeline), db = timelineToDays(b.timeline);
+                      return da - db; // shortest (most urgent) first
+                    }
+                    return 0;
+                  });
+                  const RC = { high: { bg: "#fee2e2", color: "#dc2626", dot: "#ef4444" }, medium: { bg: "#fef3c7", color: "#d97706", dot: "#f59e0b" }, low: { bg: "#f0fdf4", color: "#16a34a", dot: "#22c55e" } };
+                  return (
+                    <div className="crm-card" style={{ marginTop: "20px", padding: "20px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+                        <span className="crm-section-title" style={{ margin: 0 }}>📋 Tasks</span>
+                        <div style={{ display: "flex", gap: "6px" }}>
+                          {[["risk", "Criticality"], ["intent", "Intent"], ["timeline", "Timeline"]].map(([key, label]) => (
+                            <button key={key} type="button" onClick={() => setDashTaskSort(key)} style={{
+                              padding: "4px 12px", borderRadius: "20px", fontSize: "12px", cursor: "pointer", transition: "all 0.15s",
+                              border: dashTaskSort === key ? "1.5px solid #6366f1" : "1px solid #e5e7eb",
+                              background: dashTaskSort === key ? "#eef2ff" : "#ffffff",
+                              color: dashTaskSort === key ? "#4338ca" : "#6b7280",
+                              fontWeight: dashTaskSort === key ? "600" : "400",
+                            }}>{label}</button>
+                          ))}
+                        </div>
+                      </div>
+                      <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: "8px" }}>
+                        {sorted.map((rec) => {
+                          const rc = RC[rec.risk_level] || { bg: "#f9fafb", color: "#6b7280", dot: "#9ca3af" };
+                          return (
+                            <li key={rec.id}
+                              onClick={() => setActiveSection("records")}
+                              onMouseEnter={e => e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.08)"}
+                              onMouseLeave={e => e.currentTarget.style.boxShadow = "none"}
+                              style={{ display: "flex", alignItems: "flex-start", gap: "12px", padding: "12px 14px", borderRadius: "10px", background: "#f8fafc", border: "1px solid #f1f5f9", cursor: "pointer", transition: "box-shadow 0.15s" }}
+                            >
+                              <span style={{ flexShrink: 0, marginTop: "5px", width: "9px", height: "9px", borderRadius: "50%", background: rc.dot, display: "inline-block" }} />
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginBottom: "4px" }}>
+                                  {/* Show stakeholder names if available, else company, else Record #ID */}
+                                  <span style={{ fontWeight: "600", fontSize: "14px", color: "#111827" }}>
+                                    {Array.isArray(rec.stakeholders) && rec.stakeholders.length > 0
+                                      ? rec.stakeholders.slice(0, 3).join(", ")
+                                      : rec.mentioned_company?.trim()
+                                      ? rec.mentioned_company
+                                      : `Record #${rec.id}`}
+                                  </span>
+                                  {rec.intent?.trim() && (
+                                    <span style={{
+                                      fontSize: "11px", fontWeight: "600", padding: "2px 8px", borderRadius: "12px",
+                                      background: rec.intent.toLowerCase() === "high" ? "#dbeafe" : rec.intent.toLowerCase() === "medium" ? "#fef3c7" : "#f0fdf4",
+                                      color: rec.intent.toLowerCase() === "high" ? "#1d4ed8" : rec.intent.toLowerCase() === "medium" ? "#d97706" : "#16a34a",
+                                    }}>
+                                      {rec.intent.toUpperCase()} INTENT
+                                    </span>
+                                  )}
+                                  {rec.risk_level && <span style={{ fontSize: "11px", fontWeight: "600", padding: "2px 8px", borderRadius: "12px", background: rc.bg, color: rc.color }}>{rec.risk_level.toUpperCase()} RISK</span>}
+                                  {rec.timeline?.trim() && <span style={{ fontSize: "11px", color: "#6b7280" }}>⏱ {rec.timeline}</span>}
+                                </div>
+                                <p style={{ margin: 0, fontSize: "13px", color: "#4b5563", lineHeight: "1.5", overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                                  {rec.summary?.trim() || rec.next_action?.trim() || "No summary available."}
+                                </p>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  );
+                })()}
+
               </>
             )}
 
