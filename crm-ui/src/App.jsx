@@ -263,6 +263,21 @@ function App() {
   const [hubspotNoticeByRecord, setHubspotNoticeByRecord] = useState({});
   const [hubspotSyncMap, setHubspotSyncMap] = useState({});
 
+  // Email Generation Modal state
+  const [emailModalVisible, setEmailModalVisible] = useState(false);
+  const [emailGeneratingToken, setEmailGeneratingToken] = useState(null);
+  const [emailModalData, setEmailModalData] = useState({
+    to: "",
+    subject: "",
+    body: "",
+    contactId: null,
+    dealId: null
+  });
+
+  // Schedule Meeting Modal state
+  const [meetingModalVisible, setMeetingModalVisible] = useState(false);
+  const [meetingModalRecord, setMeetingModalRecord] = useState(null);
+
   const [insightsData, setInsightsData] = useState(null);
   const [insightsLoading, setInsightsLoading] = useState(true);
   const [insightsError, setInsightsError] = useState(null);
@@ -535,6 +550,49 @@ function App() {
     setHsPreviewSyncing(false);
     setHsTagInput("");
     setHsStakeholderInput("");
+  };
+
+  const handleGenerateEmail = async (row) => {
+    setEmailGeneratingToken(row.id);
+    try {
+      const res = await fetch("http://localhost:8000/api/v1/google/gmail/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          record_id: row.id,
+          summary: row.summary || "",
+          pain_points: row.pain_points || "",
+          next_action: row.next_action || "",
+          mentioned_company: row.mentioned_company || "",
+          contact_id: row.contact_id || null,
+          deal_id: row.deal_id || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Request failed (${res.status})`);
+      }
+      setEmailModalData({
+        to: data.to || "",
+        subject: data.subject || "",
+        body: data.body || "",
+        contactId: row.contact_id,
+        dealId: row.deal_id
+      });
+      setEmailModalVisible(true);
+    } catch (err) {
+      console.error("Error generating email:", err);
+      setEmailModalData({
+        to: "",
+        subject: "",
+        body: `⚠️ Could not generate email draft.\n\nReason: ${err.message}\n\nYou can still type your message manually below.`,
+        contactId: row.contact_id,
+        dealId: row.deal_id
+      });
+      setEmailModalVisible(true);
+    } finally {
+      setEmailGeneratingToken(null);
+    }
   };
 
   const getPreviewList = (field) => {
@@ -1234,12 +1292,8 @@ function App() {
                   <p className="crm-page-desc">Live snapshot of ingested interactions and AI-parsed revenue signals.</p>
                 </div>
 
-                {/* ── Google Integrations ── */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '20px', marginBottom: '24px' }}>
-                  <GoogleConnect />
-                  <EmailComposer contactId={1} dealId={1} />
-                  <ScheduleReminder contactId={1} dealId={1} />
-                </div>
+                {/* ── Google Integrations section removed ── */}
+
 
                 {/* ── Stats row ── */}
                 <div className="crm-ai-kpi-row">
@@ -1973,12 +2027,17 @@ function App() {
 
             {activeSection === "records" && (
               <>
-                <div className="crm-page-head">
-                  <h1 className="crm-page-title">CRM Records</h1>
-                  <p className="crm-page-desc">
-                    Interaction mining output: budget, intent, mapping, and
-                    transcript excerpts—search and open a card for full detail.
-                  </p>
+                <div className="crm-page-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                  <div>
+                    <h1 className="crm-page-title">CRM Records</h1>
+                    <p className="crm-page-desc">
+                      Interaction mining output: budget, intent, mapping, and
+                      transcript excerpts—search and open a card for full detail.
+                    </p>
+                  </div>
+                  <div>
+                    <GoogleConnect minimal={true} />
+                  </div>
                 </div>
 
                 <div className="crm-card crm-records-card">
@@ -2279,6 +2338,31 @@ function App() {
                                         </span>
                                       ) : hsSynced ? "Re-sync to HubSpot" : "Sync to HubSpot"}
                                     </button>
+                                    
+                                    <button
+                                      type="button"
+                                      className="crm-hubspot-btn"
+                                      style={{ marginLeft: '12px', background: '#ffffff', color: '#111827', border: '1px solid #d1d5db' }}
+                                      onClick={() => handleGenerateEmail(row)}
+                                      disabled={emailGeneratingToken === row.id}
+                                    >
+                                      {emailGeneratingToken === row.id ? (
+                                        <span className="crm-hubspot-btn-inner">
+                                          <Spinner size={12} />
+                                          Generating…
+                                        </span>
+                                      ) : "Generate Mail"}
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      className="crm-hubspot-btn"
+                                      style={{ marginLeft: '12px', background: '#ffffff', color: '#111827', border: '1px solid #d1d5db' }}
+                                      onClick={() => { setMeetingModalRecord(row); setMeetingModalVisible(true); }}
+                                    >
+                                      📅 Schedule Meeting
+                                    </button>
+
                                     {hubspotNoticeByRecord[row.id]?.message ? (
                                       <span
                                         className={
@@ -2894,6 +2978,48 @@ function App() {
           </div>
         )}
       </div>
+      {/* ── Overlay Modal for Email ── */}
+      {emailModalVisible && (
+        <div style={{
+          position: 'fixed',
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 9999,
+          padding: '20px'
+        }}>
+          <EmailComposer 
+            contactId={emailModalData.contactId}
+            dealId={emailModalData.dealId}
+            defaultEmail={emailModalData.to}
+            defaultSubject={emailModalData.subject}
+            defaultBody={emailModalData.body}
+            onClose={() => setEmailModalVisible(false)}
+          />
+        </div>
+      )}
+      {/* \u2500\u2500 Overlay Modal for Schedule Meeting \u2500\u2500 */}
+      {meetingModalVisible && meetingModalRecord && (
+        <div style={{
+          position: 'fixed',
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 9999,
+          padding: '20px'
+        }}>
+          <ScheduleReminder
+            contactId={meetingModalRecord.contact_id}
+            dealId={meetingModalRecord.deal_id}
+            onClose={() => { setMeetingModalVisible(false); setMeetingModalRecord(null); }}
+          />
+        </div>
+      )}
+
     </div>
   );
 }

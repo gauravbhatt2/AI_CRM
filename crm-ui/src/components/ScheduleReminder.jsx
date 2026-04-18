@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import axios from 'axios';
 
-const ScheduleReminder = ({ contactId, dealId, defaultEmail = "" }) => {
+const ScheduleReminder = ({ contactId, dealId, defaultEmail = "", onClose }) => {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [startTime, setStartTime] = useState('');
@@ -35,8 +35,19 @@ const ScheduleReminder = ({ contactId, dealId, defaultEmail = "" }) => {
   };
 
   return (
-    <div style={{ padding: '16px', background: '#ffffff', borderRadius: '8px', border: '1px solid #e5e7eb', marginBottom: '20px' }}>
-      <h3 style={{ margin: '0 0 16px 0', fontSize: '18px', fontWeight: '600', color: '#111827' }}>Schedule Meeting</h3>
+    <div style={{ padding: '24px', background: '#ffffff', borderRadius: '12px', border: '1px solid #e5e7eb', marginBottom: '20px', width: '100%', maxWidth: '600px', boxShadow: '0 10px 25px -5px rgba(0,0,0,0.1)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+        <h3 style={{ margin: '0', fontSize: '20px', fontWeight: '600', color: '#111827' }}>Schedule Meeting</h3>
+        {onClose && (
+          <button
+            onClick={onClose}
+            type="button"
+            style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#6b7280', fontSize: '18px' }}
+          >
+            ✕
+          </button>
+        )}
+      </div>
       
       {status === 'success' && (
         <div style={{ padding: '12px', background: '#def7ec', color: '#03543f', borderRadius: '6px', marginBottom: '16px', fontSize: '14px' }}>

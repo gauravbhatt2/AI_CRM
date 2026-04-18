@@ -1,11 +1,18 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
-const EmailComposer = ({ contactId, dealId, defaultEmail = "" }) => {
+const EmailComposer = ({ contactId, dealId, defaultEmail = "", defaultSubject = "", defaultBody = "", onClose }) => {
   const [to, setTo] = useState(defaultEmail);
-  const [subject, setSubject] = useState('');
-  const [body, setBody] = useState('');
+  const [subject, setSubject] = useState(defaultSubject);
+  const [body, setBody] = useState(defaultBody);
   const [status, setStatus] = useState(null);
+
+  // Sync props if they change externally (e.g. from LLM generation)
+  useEffect(() => {
+    if (defaultEmail) setTo(defaultEmail);
+    if (defaultSubject) setSubject(defaultSubject);
+    if (defaultBody) setBody(defaultBody);
+  }, [defaultEmail, defaultSubject, defaultBody]);
 
   const handleSend = async (e) => {
     e.preventDefault();
@@ -28,8 +35,19 @@ const EmailComposer = ({ contactId, dealId, defaultEmail = "" }) => {
   };
 
   return (
-    <div style={{ padding: '16px', background: '#ffffff', borderRadius: '8px', border: '1px solid #e5e7eb', marginBottom: '20px' }}>
-      <h3 style={{ margin: '0 0 16px 0', fontSize: '18px', fontWeight: '600', color: '#111827' }}>Send Email via Gmail</h3>
+    <div style={{ padding: '24px', background: '#ffffff', borderRadius: '12px', border: '1px solid #e5e7eb', marginBottom: '20px', width: '100%', maxWidth: '600px', alignSelf: 'center', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.1)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+        <h3 style={{ margin: '0', fontSize: '20px', fontWeight: '600', color: '#111827' }}>Send Email via Gmail</h3>
+        {onClose && (
+          <button 
+            onClick={onClose}
+            type="button"
+            style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#6b7280', fontSize: '18px' }}
+          >
+            ✕
+          </button>
+        )}
+      </div>
       
       {status === 'success' && (
         <div style={{ padding: '12px', background: '#def7ec', color: '#03543f', borderRadius: '6px', marginBottom: '16px', fontSize: '14px' }}>
