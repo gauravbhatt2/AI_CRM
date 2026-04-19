@@ -26,6 +26,9 @@ def groq_chat_with_retry(
     *,
     json_mode: bool,
     max_attempts: int = 3,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    max_tokens: int = 4096,
 ) -> str:
     """
     Call Groq chat with retries on 429. Re-raises RateLimitError after last attempt.
@@ -33,7 +36,13 @@ def groq_chat_with_retry(
     last: BaseException | None = None
     for attempt in range(max_attempts):
         try:
-            return groq_chat_completion(prompt, json_mode=json_mode)
+            return groq_chat_completion(
+                prompt,
+                json_mode=json_mode,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+            )
         except RateLimitError as e:
             last = e
             if attempt == max_attempts - 1:

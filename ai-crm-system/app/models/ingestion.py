@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -82,6 +82,15 @@ class ExtractedEntities(BaseModel):
         return out
 
 
+class ExtractedFacts(BaseModel):
+    """Phase-1 factual extraction: statements, entities, participants, timestamps (no scoring)."""
+
+    statements: list[str] = Field(default_factory=list)
+    entities: dict[str, Any] = Field(default_factory=dict)
+    participants: list[str] = Field(default_factory=list)
+    timestamps: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class TranscriptIngestResponse(BaseModel):
     """Transcript accepted; includes LLM extraction, CRM links, and DB row id."""
 
@@ -92,6 +101,10 @@ class TranscriptIngestResponse(BaseModel):
     contact_id: int | None = Field(default=None, description="Linked Contact id")
     deal_id: int | None = Field(default=None, description="Linked Deal id")
     extracted: ExtractedEntities = Field(..., description="Structured CRM fields")
+    extracted_facts: ExtractedFacts | None = Field(
+        default=None,
+        description="Phase-1 factual extraction (statements, entities, participants, timestamps)",
+    )
     structured_transcript: StructuredTranscript | None = Field(
         default=None,
         description="Timed segments (and speakers when available)",
@@ -114,6 +127,10 @@ class AudioIngestResponse(BaseModel):
     contact_id: int | None = Field(default=None, description="Linked Contact id")
     deal_id: int | None = Field(default=None, description="Linked Deal id")
     extracted: ExtractedEntities = Field(..., description="Structured CRM fields from LLM extraction")
+    extracted_facts: ExtractedFacts | None = Field(
+        default=None,
+        description="Phase-1 factual extraction merged from transcript",
+    )
     structured_transcript: StructuredTranscript | None = Field(
         default=None,
         description="Whisper segments with timestamps and inferred speakers",

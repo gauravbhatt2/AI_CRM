@@ -12,6 +12,11 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
+
 _model = None
 _loaded_model_name: str | None = None
 
@@ -72,8 +77,21 @@ def transcribe_audio_detailed(file_path: str) -> dict:
     Speaker labels are not added here; use `label_segment_speakers` after Groq (optional).
     """
     model = _get_whisper_model()
+    beam = 1 if getattr(settings, "whisper_fast_decode", False) else int(
+        getattr(settings, "whisper_beam_size", 5) or 5
+    )
+    beam = max(1, min(10, beam))
+    fp16 = bool(torch and torch.cuda.is_available())
+    lang = (getattr(settings, "whisper_language", None) or "").strip() or None
     try:
-        result = model.transcribe(file_path)
+        result = model.transcribe(
+            file_path,
+            verbose=False,
+            language=lang,
+            fp16=fp16,
+            beam_size=beam,
+            condition_on_previous_text=True,
+        )
     except FileNotFoundError as e:
         # Whisper loads audio via FFmpeg; missing ffmpeg on PATH surfaces as WinError 2 / ENOENT.
         raise FfmpegRequiredError(_FFMPEG_HINT) from e

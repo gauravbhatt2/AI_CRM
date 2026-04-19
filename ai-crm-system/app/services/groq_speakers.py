@@ -235,6 +235,38 @@ def _heuristic_label_segments(segments: list[dict[str, Any]]) -> list[dict[str, 
     return _repair_speaker_turns(out)
 
 
+def heuristic_speaker_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rule-based speaker labels without Groq (Sales/Customer heuristics)."""
+    return _heuristic_label_segments(segments)
+
+
+def maybe_relabel_speakers_ab(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Map distinct speaker labels to Speaker A / Speaker B (first two unique speakers in order).
+    Collapses additional speakers onto Speaker B. No-op unless settings.transcript_speaker_labels == "speaker_ab".
+    """
+    if getattr(settings, "transcript_speaker_labels", "roles") != "speaker_ab":
+        return segments
+    if not segments:
+        return segments
+    mapping: dict[str, str] = {}
+    labels = ("Speaker A", "Speaker B")
+    next_idx = 0
+    out: list[dict[str, Any]] = []
+    for seg in segments:
+        row = dict(seg)
+        raw = str(row.get("speaker") or "").strip() or "__empty__"
+        if raw not in mapping:
+            if next_idx < 2:
+                mapping[raw] = labels[next_idx]
+                next_idx += 1
+            else:
+                mapping[raw] = "Speaker B"
+        row["speaker"] = mapping[raw]
+        out.append(row)
+    return out
+
+
 def label_segment_speakers(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Return a copy of segments with `speaker` filled (short labels like 'Rep', 'Prospect', or names).

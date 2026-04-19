@@ -21,6 +21,7 @@ def create_crm_record(
     external_interaction_id: str | None = None,
     participants: list[str] | None = None,
     ai_intelligence: dict | None = None,
+    followup_email: str | None = None,
 ) -> CrmRecord:
     """Insert a row from transcript text, structured extraction, and optional CRM links."""
     st: dict | None = None
@@ -66,6 +67,7 @@ def create_crm_record(
         summary=str(ai.get("summary", ""))[:4096],
         tags=list(ai.get("tags", [])),
         next_action=str(ai.get("next_action", ""))[:2048],
+        followup_email=str(followup_email or "")[:16000],
         # Extraction-enriched fields
         product_version=getattr(extracted, "product_version", "") or "",
         pain_points=str(getattr(extracted, "pain_points", "") or ""),

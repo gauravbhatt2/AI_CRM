@@ -2,8 +2,8 @@
 
 ## AI-Assisted CRM Ingestion, Intelligence & HubSpot Sync
 
-**Version:** 2.0
-**Last Updated:** April 15, 2026
+**Version:** 2.3
+**Last Updated:** April 19, 2026
 **Product:** AI CRM System (FastAPI + React + PostgreSQL + Groq LLM)
 **Companion Document:** `PRD_AI_CRM.md`
 
@@ -15,8 +15,8 @@ Sales and support teams generate rich conversational data — calls, meetings, e
 
 This product solves that by turning **raw audio or text conversations** into **structured, AI-enriched CRM records** in seconds. It:
 
-1. **Transcribes** audio via local Whisper (no data leaves the server for ASR).
-2. **Extracts** 17+ structured CRM fields from conversations using LLM (Groq) with heuristic fallback.
+1. **Transcribes** audio via local Whisper (no data leaves the server for ASR); optionally **diarizes** speakers (pyannote → Speaker A/B merged to Whisper segments) when a Hugging Face token is configured.
+2. **Extracts** structured CRM fields via a **two-phase** Groq pipeline — **factual extraction** (statements, entities, participants, timestamps) then **evaluation** (intent, pain points, scoring, next actions) from merged facts — with heuristic fallback where needed.
 3. **Classifies, scores, and analyzes** every interaction through an AI Intelligence Layer — producing deal scores, risk assessments, summaries, next actions, and tags automatically.
 4. **Persists** everything to a local PostgreSQL datastore with full audit trail.
 5. **Syncs** deals, contacts, companies, and notes to **HubSpot** with proper field mapping, associations, and pipeline resolution.
@@ -82,7 +82,7 @@ The fundamental issue is that **structured CRM data requires human translation**
 
 | Area | Capabilities |
 |------|-------------|
-| **Audio Ingestion** | Upload audio/video files; local Whisper transcription; optional speaker diarization; supported formats via FFmpeg |
+| **Audio Ingestion** | Upload audio/video files; local Whisper transcription; optional **pyannote** speaker diarization (HF token) merged to segments; optional Groq/heuristic speaker labels if diarization off; supported formats via FFmpeg |
 | **Text Ingestion** | Direct transcript paste/POST; email, meeting notes, SMS content |
 | **Multi-channel Support** | Source types: `call`, `email`, `meeting`, `sms`, `crm_update` with metadata tracking |
 | **AI Extraction (17 fields)** | `budget` (integer), `intent` (high/medium/low), `timeline` (decision-only), `product`, `product_version`, `competitors`, `industry`, `pain_points`, `next_step`, `urgency_reason`, `stakeholders`, `mentioned_company`, `procurement_stage`, `use_case`, `decision_criteria`, `budget_owner`, `implementation_scope` |
@@ -91,14 +91,17 @@ The fundamental issue is that **structured CRM data requires human translation**
 | **Local CRM Datastore** | PostgreSQL with full relational model: Accounts, Contacts, Deals, CRM Records, Audit Logs |
 | **HubSpot Integration** | Create/update deals with mapped properties; resolve/create contacts and companies; create engagement notes; associate entities; pipeline/stage resolution |
 | **Analytics Dashboard** | Revenue analytics, AI intelligence metrics (intent/risk distribution pie charts, deal score averages), interaction timeline, record browser with search/filter |
-| **Modern UI** | SaaS-style React dashboard with intent badges, risk indicators, deal score bars, tag chips, loading states, animations, responsive design |
+| **Modern UI** | SaaS-style React dashboard (React Router pages) with intent badges, risk indicators, deal score bars, tag chips, loading states, animations, responsive design |
 | **Audit Trail** | Append-only audit log for every ingestion event |
+| **Agents API** | Deal chat, next-action suggestion, follow-up email/WhatsApp drafts grounded in CRM fields |
+| **Google Workspace (optional)** | OAuth flow; Gmail generate/send and Calendar scheduling when credentials are configured (on-demand; not automatic mailbox ingestion) |
 
 ### 5.2 Out of Scope (Current Release)
 
 | Item | Notes |
 |------|-------|
-| Native OAuth connectors (Gmail, Calendar, telephony) | Interactions submitted via API/UI; future integration layer |
+| Automatic ingestion from full Gmail inbox or Calendar history | Optional OAuth supports compose/send and scheduling; bulk sync from providers is not implemented |
+| Native telephony / CTI connectors | Interactions submitted via API/UI |
 | Real-time streaming transcription during live calls | Batch processing only |
 | Enterprise SSO / RBAC | Single-user deployment; authentication layer can be added |
 | Full GDPR tooling | Deployment-dependent; PII handling via access control |
@@ -119,17 +122,17 @@ The fundamental issue is that **structured CRM data requires human translation**
 ┌────────────────────────────┴────────────────────────────────────┐
 │                      FASTAPI BACKEND                            │
 │                                                                 │
-│  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌──────────────┐ │
-│  │ Ingestion│→ │ Extraction│→ │AI Intel   │→ │ CRM Mapping  │ │
-│  │ (Audio/  │  │ (Groq LLM │  │ Layer     │  │ (Account/    │ │
-│  │  Text)   │  │ +Heuristic│  │ (6 funcs) │  │  Contact/    │ │
-│  │          │  │  Fallback) │  │           │  │  Deal)       │ │
-│  └──────────┘  └───────────┘  └───────────┘  └──────┬───────┘ │
-│       │                                              │         │
-│  ┌────┴─────┐                                  ┌─────┴──────┐  │
-│  │ Whisper  │                                  │ PostgreSQL │  │
-│  │ (local)  │                                  │ (persist)  │  │
-│  └──────────┘                                  └─────┬──────┘  │
+│  ┌──────────┐  ┌────────────────┐  ┌───────────┐  ┌──────────────┐ │
+│  │ Ingestion│→ │ Facts extract  │→ │ Evaluation│→ │ CRM Mapping  │ │
+│  │ (Audio/  │  │ (Groq, single  │  │ (Groq,    │  │ (Account/    │ │
+│  │  Text)   │  │  pass + merge) │  │ from facts│  │  Contact/    │ │
+│  │          │  │                │  │ JSON)     │  │  Deal)       │ │
+│  └──────────┘  └────────────────┘  └───────────┘  └──────┬───────┘ │
+│       │                                                   │         │
+│  ┌────┴─────┐  ┌──────────────┐                    ┌─────┴──────┐  │
+│  │ Whisper  │  │ pyannote (opt)│                    │ PostgreSQL │  │
+│  │ (local)  │  │ Speaker A/B    │                    │ (persist)  │  │
+│  └──────────┘  └──────────────┘                    └─────┬──────┘  │
 │                                                      │         │
 │  ┌───────────────────────────────────────────────────┴──────┐  │
 │  │                   HubSpot Sync Service                    │  │
@@ -140,9 +143,9 @@ The fundamental issue is that **structured CRM data requires human translation**
 
 ### Data Flow
 
-1. **Ingest** — Audio files are transcribed locally via Whisper; text payloads pass through directly
-2. **Extract** — Groq LLM extracts 17 structured fields using a strict JSON prompt; heuristic fallback fills gaps if LLM is unavailable or rate-limited
-3. **Enrich** — AI Intelligence Layer runs 6 functions: classify, score, detect risk, summarize, suggest next action, auto-tag
+1. **Ingest** — Audio files are transcribed locally via Whisper; optional pyannote diarization aligns Speaker A/B to segments; text payloads pass through directly
+2. **Extract** — Groq extracts **facts** in one pass (very long transcripts are truncated with middle omitted for the facts call), merges with heuristic hints, then **evaluates** intelligence (intent, pain, score, etc.) from merged facts; heuristic fallback fills gaps if LLM is unavailable or rate-limited
+3. **Enrich** — AI Intelligence Layer merges LLM evaluation with heuristics: classify, score, detect risk, summarize, suggest next action, auto-tag
 4. **Map** — Extracted entities are resolved to existing Accounts, Contacts, and Deals (LLM + rule-based)
 5. **Persist** — Full record with all fields stored in PostgreSQL; audit event logged
 6. **Sync** — On-demand push to HubSpot with proper field mapping and entity associations
@@ -310,8 +313,9 @@ Every ingested record is automatically enriched with AI intelligence:
 
 | Document | Description |
 |----------|------------|
-| `PRD_AI_CRM.md` | Product requirements: functional specs, API reference, data model, acceptance criteria |
-| `AI_Interaction_Mining_BRD_FRD_DRD_STATUS.md` | Mapping of legacy BRD/FRD/DRD spec labels to implementation status |
+| `PRD_AI_CRM.md` | Product requirements: functional specs, API reference, data model, acceptance criteria, known limitations |
+
+Legacy “Interaction Mining” BRD/FRD/DRD themes (transcription, extraction, unified history, analytics) are covered by the in-scope capabilities above; items not delivered as product features (e.g. automated accuracy KPI jobs, enterprise RBAC) are listed under **Out of Scope** and **PRD — Known Limitations**.
 
 ---
 
@@ -321,3 +325,6 @@ Every ingested record is automatically enriched with AI intelligence:
 |---------|------|--------|---------|
 | 1.0 | April 2026 | Engineering | Initial BRD — core ingestion, extraction, HubSpot sync |
 | 2.0 | April 15, 2026 | Engineering | Expanded to cover AI Intelligence Layer (6 functions), 17-field extraction schema, advanced CRM fields, deal scoring logic, modern SaaS UI, comprehensive analytics, multi-channel ingestion, full architecture documentation |
+| 2.1 | April 18, 2026 | Engineering | Two-phase extraction, pyannote/OpenRouter, PRD alignment |
+| 2.2 | April 19, 2026 | Engineering | Agents API and optional Google Workspace OAuth reflected in scope; removed duplicate status doc; UI described as multi-page React app |
+| 2.3 | April 19, 2026 | Engineering | Facts extraction simplified to a single Groq pass (no sentence chunking); removed separate ASR cleanup / post-extraction validation modules; architecture diagram updated |

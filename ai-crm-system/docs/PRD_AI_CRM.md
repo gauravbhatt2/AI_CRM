@@ -2,8 +2,8 @@
 
 ## AI-Assisted CRM Ingestion, Intelligence & HubSpot Sync
 
-**Version:** 2.0
-**Last Updated:** April 15, 2026
+**Version:** 2.3
+**Last Updated:** April 19, 2026
 **Companion BRD:** `BRD_AI_CRM.md`
 **Product:** AI CRM System (FastAPI + React + PostgreSQL + Groq LLM)
 
@@ -36,13 +36,15 @@
 
 ## 1. Product Overview
 
-The AI CRM System is a full-stack application that automates the conversion of unstructured conversations into structured, AI-enriched CRM records. Built with **FastAPI** (backend), **React + Vite** (frontend), **PostgreSQL** (persistence), **Groq LLM** (AI extraction and intelligence), and **local Whisper** (audio transcription), it delivers:
+The AI CRM System is a full-stack application that automates the conversion of unstructured conversations into structured, AI-enriched CRM records. Built with **FastAPI** (backend), **React + Vite** (frontend), **PostgreSQL** (persistence), **Groq LLM** (factual extraction + evaluation + fallbacks), **local Whisper** (audio transcription), optional **pyannote** (speaker diarization), optional **OpenRouter** (deal chat), and optional **Google Workspace OAuth** (Gmail + Calendar on-demand), it delivers:
 
 - **Multi-channel ingestion** — audio files, transcripts, emails, meeting notes, SMS
-- **17-field structured extraction** — budget, intent, timeline, product, competitors, stakeholders, and 11 more CRM-ready fields
-- **AI Intelligence Layer** — automatic classification, deal scoring, risk detection, summarization, next action suggestions, and tagging for every record
+- **Two-phase Groq extraction** — (1) factual JSON (statements, entities, participants, timestamps) in a **single** Groq call (very long transcripts are truncated with middle omitted); merged with heuristic hints; (2) evaluation JSON (intent, pain points, deal score, risk, summary, next action) from merged facts only; refiners + AI intelligence; CRM field mapping
+- **17-field structured CRM surface** — same persisted fields as before (budget, intent, timeline, product, competitors, stakeholders, advanced fields, etc.)
+- **AI Intelligence Layer** — combines evaluation output with heuristics: classification, deal scoring, risk detection, summarization, next action, tagging
+- **Agents** — `POST /api/v1/agents/chat` (OpenRouter when configured, else Groq; CRM fields only, no raw transcript), `POST .../next-action/{id}`, `POST .../followup/{id}`
 - **HubSpot synchronization** — one-click push of deals, contacts, companies, and notes with proper field mapping and entity associations
-- **Modern analytics dashboard** — intent distribution, risk analysis, deal scoring, revenue metrics, and interaction timeline
+- **Modern analytics dashboard** — React Router app: Dashboard, Upload, Records, Insights, Timeline, Chat, Settings, Support; intent distribution, risk analysis, deal scoring, revenue metrics, interaction timeline
 
 ---
 
@@ -66,10 +68,10 @@ The AI CRM System is a full-stack application that automates the conversion of u
 User uploads audio file (.mp3, .wav, .m4a, etc.)
     │
     ▼
-System transcribes via local Whisper (with optional speaker diarization)
+System transcribes via local Whisper; optional pyannote diarization → Speaker A/B on segments
     │
     ▼
-LLM extracts 17 structured CRM fields from transcript
+Groq: factual extraction → merge with heuristics → evaluation (from facts) → refiners → 17-field CRM record shape
     │
     ▼
 AI Intelligence Layer enriches: classification, score, risk, summary, next action, tags
@@ -164,7 +166,7 @@ User clicks through to individual records for detailed view
 
 ```
 app/
-├── main.py                      # FastAPI app factory, CORS, router registration, lifespan
+├── main.py                      # FastAPI app factory, CORS, router registration, lifespan (DB init + scheduler)
 ├── core/
 │   └── config.py                # Settings class — all env variables and defaults
 ├── api/
@@ -173,10 +175,13 @@ app/
 │       ├── health.py            # GET /health — liveness check
 │       ├── ingestion.py         # POST /ingest/transcript, /ingest/audio, /ingest/interaction
 │       ├── extraction.py        # GET /api/v1/extraction/preview
-│       ├── crm.py               # GET/DELETE /api/v1/crm/records, POST /api/v1/crm/map
+│       ├── crm.py               # GET/DELETE /api/v1/crm/records, GET /{id}, POST /api/v1/crm/map
+│       ├── records_list.py      # GET /api/v1/records — alias of CRM list payload
 │       ├── analytics.py         # GET /api/v1/analytics/revenue, /insights, /ai-intelligence
 │       ├── interactions.py      # GET /api/v1/interactions/timeline
-│       └── hubspot.py           # POST /api/v1/hubspot/push/{record_id}
+│       ├── hubspot.py           # POST /api/v1/hubspot/push/{record_id}
+│       ├── agents.py            # POST /api/v1/agents/chat, /next-action/{id}, /followup/{id}
+│       └── google_workspace.py # /api/v1/google/* — OAuth, Gmail, Calendar (optional)
 ├── db/
 │   ├── database.py              # Engine init, table creation, idempotent schema migrations
 │   ├── models.py                # SQLAlchemy ORM: Account, Contact, Deal, CrmRecord, AuditLog
@@ -187,18 +192,8 @@ app/
 │   ├── crm.py                   # Pydantic: CRMMapRequest/Response
 │   ├── extraction.py            # Pydantic: extraction preview models
 │   └── health.py                # Pydantic: health response
-├── services/
-│   ├── extraction_service.py    # Extraction prompt template (17-field), prompt builder
-│   ├── groq_extraction.py       # Groq LLM execution, JSON parsing, normalization, heuristic merge
-│   ├── groq_llm.py              # OpenAI-compatible Groq client
-│   ├── groq_mapping.py          # LLM-assisted CRM entity resolution
-│   ├── groq_speakers.py         # Speaker diarization for Whisper segments
-│   ├── ai_intelligence.py       # AI Intelligence Layer — 9 functions + batch runner
-│   ├── ingestion_pipeline.py    # Orchestrator: extract → AI intel → map → persist → audit
-│   ├── mapping_service.py       # CRM entity resolution (LLM + rules)
-│   ├── transcription_service.py # Local Whisper transcription
-│   ├── hubspot_client.py        # Low-level HubSpot REST operations
-│   └── hubspot_service.py       # High-level HubSpot sync orchestration
+├── agents/                      # chat_agent, followup_agent, next_action_agent, tools
+├── services/                    # Full list in §19 — extraction_service, facts_extraction, evaluation_groq, groq_extraction, …
 ├── utils/
 │   ├── budget.py                # parse_budget_to_int — consistent budget parsing
 │   ├── groq_retry.py            # groq_chat_with_retry — rate limit retry with backoff
@@ -213,19 +208,14 @@ app/
 
 ```
 crm-ui/src/
-├── main.jsx          # React root mount
-├── App.jsx           # Single-file app (~2000 lines):
-│                     #   - Helper components (IntentBadge, RiskIndicator, DealScoreBar, Spinner, EmptyState)
-│                     #   - Section navigation (sidebar)
-│                     #   - Audio/text ingestion with loading states
-│                     #   - CRM record list with search, filter, expand
-│                     #   - AI Intelligence dashboard (KPIs, pie charts, table)
-│                     #   - Revenue analytics (bar charts)
-│                     #   - Interaction timeline
-│                     #   - HubSpot sync per record
-├── crm-app.css       # Full design system: CSS variables, components, animations, responsive
-├── index.css         # Base styles
-└── App.css           # Legacy styles
+├── main.jsx              # React root mount
+├── App.jsx               # react-router-dom routes → Layout + pages
+├── components/           # Layout, Sidebar, TopBar, AIChatbot, UploadReviewPanel, GoogleConnect, …
+├── pages/                # Dashboard, Upload, RecordsPage, Insights, Timeline, ChatPage, SettingsPage, SupportPage
+├── lib/api.js            # API_BASE_URL (VITE_API_URL override), endpoint paths
+├── crm-app.css           # Design system: CSS variables, components, animations
+├── index.css             # Base styles
+└── App.css               # Legacy / global overrides
 ```
 
 ### 4.3 Pipeline Flow (Internal)
@@ -235,30 +225,23 @@ crm-ui/src/
 │                    run_transcript_pipeline()                          │
 │                                                                      │
 │  1. receiver.accept_transcript()         → job_id, context           │
-│  2. extract_entities(transcript)         → 17 structured fields      │
-│     └─ build_extraction_prompt()         → strict JSON prompt        │
-│     └─ execute_groq_json_extraction()    → LLM call + parse          │
-│        └─ _run_groq_extraction_attempt() → JSON mode, then fallback  │
-│        └─ heuristic_extract_entities()   → rule-based backup         │
-│        └─ merge_extraction_prefer_llm()  → LLM wins, heuristic fills │
-│        └─ refine_product_core_field()    → product cleanup           │
-│        └─ refine_timeline_core_field()   → timeline cleanup          │
-│  3. map_entities_to_crm()                → account/contact/deal IDs  │
-│  4. run_ai_intelligence()                → classification, score,    │
-│     │                                      risk, summary, next       │
-│     │                                      action, tags              │
-│     ├─ normalize_data()                                              │
-│     ├─ classify_interaction()                                        │
-│     ├─ score_deal()                                                  │
-│     ├─ detect_risk()                                                 │
-│     ├─ generate_summary()                                            │
-│     ├─ auto_tag()                                                    │
-│     └─ generate_next_action()                                        │
-│  5. create_crm_record()                  → PostgreSQL insert         │
-│  6. log_audit_event()                    → append-only audit         │
-│  7. Return TranscriptIngestResponse                                  │
+│  2. extract_transcript_bundle()          → extracted, ai_intel,     │
+│     │                                      merged_extracted_facts     │
+│     ├─ run_facts_extraction()           → Groq factual JSON (single pass)│
+│     ├─ merge_facts_payloads()           → LLM facts + heuristic facts │
+│     ├─ run_evaluation_groq()            → intelligence from facts    │
+│     ├─ facts_eval_to_extracted_and_ai() → legacy entity + ai shapes   │
+│     ├─ heuristic_extract_entities()     → fill gaps                  │
+│     ├─ refine_* / enrich_*              → budget, company, product…  │
+│     └─ run_ai_intelligence()            → merge LLM + heuristics      │
+│  3. map_entities_to_crm()                → account/contact/deal IDs    │
+│  4. create_crm_record()                  → PostgreSQL insert           │
+│  5. log_audit_event()                    → append-only audit          │
+│  6. Return TranscriptIngestResponse (+ optional extracted_facts)      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+**Audio ingest** (`/ingest/audio`): Whisper → optional **pyannote** segment labels → `run_transcript_pipeline` with `StructuredTranscript` → optional Groq/heuristic speaker pass if pyannote did not apply.
 
 ---
 
@@ -282,7 +265,7 @@ crm-ui/src/
 
 | ID | Requirement | Priority | Status |
 |----|-------------|----------|--------|
-| EXT-1 | Extract 17 core fields via strict JSON prompt to Groq LLM | Must | Done |
+| EXT-1 | Extract 17 core CRM fields via two-phase Groq pipeline (facts → merge with heuristics → evaluation) + normalization | Must | Done |
 | EXT-2 | Budget normalization: strip currency symbols, convert to integer (`$75k` → `75000`) | Must | Done |
 | EXT-3 | Intent standardization: output exactly `"high"`, `"medium"`, or `"low"` | Must | Done |
 | EXT-4 | Timeline filtering: extract only decision/implementation timelines; ignore logistics | Must | Done |
@@ -294,45 +277,15 @@ crm-ui/src/
 | EXT-10 | Merge heuristic results with LLM output (LLM non-empty values win) | Should | Done |
 | EXT-11 | Post-LLM refinement passes for product and timeline fields | Should | Done |
 | EXT-12 | Enrich `map_version` in custom_fields from transcript patterns for automotive contexts | Should | Done |
-| EXT-13 | Prompt truncation for very long transcripts (120K char limit with middle omission) | Should | Done |
+| EXT-13 | Very long transcripts: facts prompt truncates middle section (see `TRANSCRIPT_LLM_MAX_CHARS` in `extraction_service.py`); evaluation still uses merged facts JSON only | Should | Done |
 | EXT-14 | No hallucination: null for any field not evidenced in the text | Must | Done |
 
-### 6.1 Extraction Prompt Design
+### 6.1 Extraction & evaluation prompts
 
-The extraction prompt uses a strict structure with clearly delineated rule sections:
-
-```
-═══ HARD RULES ═══
-  - Strict JSON only, no markdown, no commentary
-  - No hallucination; null for missing
-  - All 17 keys must appear
-
-═══ BUDGET RULES ═══
-  - Integer output (no currency symbols)
-  - Conversion examples provided
-  - null if not mentioned
-
-═══ INTENT RULES ═══
-  - Exactly "high" | "medium" | "low"
-  - Definitions for each level
-  - Default to "medium" if uncertain
-
-═══ TIMELINE RULES ═══
-  - Decision/implementation only
-  - Explicit ignore list (ship, send, deliver, mail)
-  - Valid/invalid examples
-
-═══ PRODUCT + VERSION ═══
-  - Separation rules with examples
-
-═══ COMPETITOR RULES ═══
-  - Normalize names
-  - Deduplicate
-
-═══ OUTPUT FORMAT ═══
-  - Exact 17-key JSON template
-  - Field definitions
-```
+- **Phase 1 — Facts** (`extraction_service.py`): JSON with `statements`, `entities` (budget, company, product, …), `participants`, `timestamps` — no intent/pain/scoring. One Groq call per ingest; `facts_extraction.run_facts_extraction` invokes `build_facts_extraction_prompt`.
+- **Phase 2 — Evaluation** (`evaluation_groq.py`): JSON with intent, pain_points, deal_score, risk, summary, next_action, etc., **only from merged facts** (no raw transcript in the prompt).
+- Heuristic facts may be merged with LLM facts in `facts_extraction.merge_facts_payloads` (same helper used when combining sources).
+- Legacy **17-field** `ExtractedEntities` is produced by `groq_extraction.facts_eval_to_extracted_and_ai` plus refiners and `run_ai_intelligence`.
 
 ### 6.2 Normalization Pipeline
 
@@ -345,25 +298,11 @@ The extraction output goes through multiple normalization layers:
 5. **`_coerce_custom_fields()`** — Limits to 20 entries, trims key/value lengths
 6. **`_unwrap_extraction_payload()`** — Handles LLM wrapping (e.g. `{extraction: {...}}`)
 
-### 6.3 Fallback Strategy
+### 6.3 Fallback strategy (summary)
 
-```
-1. Primary attempt: Groq JSON mode (json_mode=True)
-   ├── Success + non-empty → use result
-   └── Empty or failure → continue
-
-2. Retry attempt: Groq without JSON mode (json_mode=False)
-   ├── Success + non-empty → use result
-   └── Failure → continue
-
-3. Heuristic fallback: Rule-based regex extraction
-   ├── Budget patterns, intent keywords, competitor mentions
-   └── Timeline inference, company name detection
-
-4. Merge: LLM result + heuristic (LLM values win when non-empty)
-
-5. Refinement: Product cleanup, timeline cleanup, map version enrichment
-```
+1. Groq facts extraction (single pass); merge with heuristic facts via `merge_facts_payloads` where applicable.
+2. Groq evaluation on merged facts; if it fails, **deterministic_evaluation** from facts JSON string.
+3. Heuristic entity hints merged where fields are empty; refiners and `run_ai_intelligence` fill/normalize downstream fields.
 
 ---
 
@@ -515,10 +454,24 @@ The frontend uses a CSS-variable-based design system:
 | Method | Path | Description | Response |
 |--------|------|-------------|----------|
 | `GET` | `/api/v1/crm/records` | List all CRM records with all fields | `list[CrmRecordOut]` — includes all 17 extraction fields, AI intelligence fields, CRM links |
+| `GET` | `/api/v1/crm/records/{record_id}` | Single CRM record by id | `CrmRecordOut` |
+| `GET` | `/api/v1/records` | Same list payload as `/api/v1/crm/records` (alias) | `list[CrmRecordOut]` |
 | `DELETE` | `/api/v1/crm/records` | Delete all records (destructive reset) | `DeleteRecordsResponse` (deleted count) |
 | `POST` | `/api/v1/crm/map` | Map extracted payload to CRM entities | `CRMMapResponse` |
 
-### 12.3 Analytics Endpoints
+### 12.3 Agents Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/agents/chat` | Deal Q&A grounded in CRM fields for `record_id` (optional short `conversation` history) |
+| `POST` | `/api/v1/agents/next-action/{record_id}` | Suggested next best action for the record |
+| `POST` | `/api/v1/agents/followup/{record_id}` | Generated follow-up email and WhatsApp text |
+
+### 12.4 Google Workspace Endpoints (optional)
+
+Requires Google OAuth client credentials in environment. Typical paths under `/api/v1/google/`: `auth/` (start OAuth), `auth/callback`, `auth/signout`, `status/`, Gmail generate/send, Calendar schedule — see OpenAPI at `/docs` for the full list.
+
+### 12.5 Analytics Endpoints
 
 | Method | Path | Description | Response |
 |--------|------|-------------|----------|
@@ -526,7 +479,7 @@ The frontend uses a CSS-variable-based design system:
 | `GET` | `/api/v1/analytics/ai-intelligence` | AI intelligence aggregation | `AIIntelligenceResponse` (total_records, intent_distribution, risk_distribution, avg_deal_score, records[]) |
 | `GET` | `/api/v1/analytics/insights` | Revenue/interaction intelligence summary | `InsightsResponse` (total_interactions, total_budget_sum, avg_budget, by_source_type, intent_keywords_high/low) |
 
-### 12.4 Other Endpoints
+### 12.6 Other Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -535,7 +488,7 @@ The frontend uses a CSS-variable-based design system:
 | `GET` | `/api/v1/interactions/timeline` | Chronological interactions (supports `limit` and `source_type` query params) |
 | `POST` | `/api/v1/hubspot/push/{record_id}` | Sync one CRM record to HubSpot |
 
-### 12.5 API Documentation
+### 12.7 API Documentation
 
 - **OpenAPI (Swagger UI):** `/docs`
 - **ReDoc:** `/redoc`
@@ -676,14 +629,22 @@ Schema migrations are handled idempotently in `database.py`:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | Yes | — | PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/db`) |
-| `GROQ_API_KEY` | Yes | — | Groq API key for LLM extraction and intelligence |
+| `GROQ_API_KEY` | Yes | — | Groq API key for extraction, evaluation, and chat fallback |
 | `GROQ_MODEL` | No | `llama-3.3-70b-versatile` | Groq model identifier |
-| `WHISPER_MODEL` | No | `base` | Local Whisper model size (`tiny`, `base`, `small`, `medium`, `large`) |
-| `GROQ_LABEL_SPEAKERS` | No | `false` | Enable LLM-based speaker diarization |
+| `WHISPER_MODEL` | No | `turbo` | Local Whisper checkpoint (`turbo` / large-v3-turbo is faster than `large` / `large-v3` for English; also `tiny` … `large-v3`) |
+| `WHISPER_LANGUAGE` | No | `en` | ISO language code for Whisper — fixed `en` skips auto language detection |
+| `HUGGINGFACE_TOKEN` | No | — | Hugging Face token; enables pyannote diarization when set + license accepted |
+| `PYANNOTE_ENABLED` | No | `true` | Set `false` to skip pyannote even if token is set |
+| `OPENROUTER_API_KEY` | No | — | OpenRouter key for deal chat (`/agents/chat`) |
+| `OPENROUTER_MODEL` | No | `google/gemma-3-12b-it:free` | OpenRouter model id |
+| `GROQ_LABEL_SPEAKERS` | No | `true` | Extra Groq call for per-segment speaker labels when pyannote did not run |
 | `HUBSPOT_API_KEY` | No | — | HubSpot private app token (enables sync features) |
 | `HUBSPOT_PIPELINE_ID` | No | — | Override HubSpot pipeline ID |
 | `HUBSPOT_DEAL_STAGE_ID` | No | — | Override HubSpot deal stage ID |
-| `CORS_ORIGINS` | No | `["*"]` | Allowed CORS origins |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | No | — | Optional Google OAuth (Gmail + Calendar routes under `/api/v1/google/`) |
+| `GOOGLE_OAUTH_SUCCESS_REDIRECT` | No | `http://localhost:5173/` | Browser redirect after OAuth callback |
+| `GMAIL_SEND_ENABLED` | No | `false` | When `true`, real Gmail send when API is configured |
+| `CORS_ORIGINS` | No | (see `config.py`) | Allowed CORS origins (list of dev URLs) |
 | `DEBUG` | No | `false` | Enable debug logging |
 
 ### 15.2 Backend Dependencies
@@ -700,6 +661,7 @@ python-dotenv
 openai-whisper
 requests
 python-multipart
+torch; torchaudio; pyannote.audio   # optional — speaker diarization
 ```
 
 ### 15.3 Frontend Dependencies
@@ -736,54 +698,54 @@ npm run build  # Production build to dist/
 
 ### 16.1 Ingestion
 
-- [ ] Audio upload produces transcript and persisted record with all fields populated
-- [ ] Text ingestion extracts 17 fields and stores record with correct source_type
-- [ ] Interaction webhook processes email/meeting/SMS content through full pipeline
-- [ ] External ID deduplication tracking works across multiple ingestions
-- [ ] Participant metadata is preserved from both explicit list and metadata.participants
+- [x] Audio upload produces transcript and persisted record with all fields populated
+- [x] Text ingestion extracts 17 fields and stores record with correct source_type
+- [x] Interaction webhook processes email/meeting/SMS content through full pipeline
+- [x] External ID deduplication tracking works across multiple ingestions
+- [x] Participant metadata is preserved from both explicit list and metadata.participants
 
 ### 16.2 Extraction
 
-- [ ] Budget is always an integer (or null) — no currency symbols in stored value
-- [ ] Intent is always exactly `"high"`, `"medium"`, or `"low"`
-- [ ] Timeline contains only decision/implementation phrases — logistics phrases are excluded
-- [ ] Product and product_version are correctly separated
-- [ ] Competitors are normalized and deduplicated
-- [ ] All 6 advanced CRM fields (`mentioned_company`, `procurement_stage`, `use_case`, `decision_criteria`, `budget_owner`, `implementation_scope`) are extracted when present
-- [ ] Heuristic fallback produces usable output when LLM is unavailable
-- [ ] No hallucinated values — fields are null when information is not in the text
+- [x] Budget is always an integer (or null) — no currency symbols in stored value
+- [x] Intent is always exactly `"high"`, `"medium"`, or `"low"`
+- [x] Timeline contains only decision/implementation phrases — logistics phrases are excluded
+- [x] Product and product_version are correctly separated
+- [x] Competitors are normalized and deduplicated
+- [x] All 6 advanced CRM fields (`mentioned_company`, `procurement_stage`, `use_case`, `decision_criteria`, `budget_owner`, `implementation_scope`) are extracted when present
+- [x] Heuristic fallback produces usable output when LLM is unavailable
+- [x] No hallucinated values — fields are null when information is not in the text
 
 ### 16.3 AI Intelligence
 
-- [ ] Every record receives interaction_type, deal_score, risk_level, risk_reason, summary, next_action, and tags
-- [ ] Deal score follows defined formula: budget +20, high intent +30, medium +15, timeline +20, competitors +10, missing fields -5
-- [ ] Next action is max 12 words and starts with a verb
-- [ ] Summary is exactly 2 concise sentences
-- [ ] Classification covers all four types: sales, support, inquiry, complaint
-- [ ] Risk detection identifies negative sentiment and competitive threats
+- [x] Every record receives interaction_type, deal_score, risk_level, risk_reason, summary, next_action, and tags
+- [x] Deal score follows defined formula: budget +20, high intent +30, medium +15, timeline +20, competitors +10, missing fields -5
+- [x] Next action is max 12 words and starts with a verb
+- [x] Summary is exactly 2 concise sentences
+- [x] Classification covers all four types: sales, support, inquiry, complaint
+- [x] Risk detection identifies negative sentiment and competitive threats
 
 ### 16.4 HubSpot Sync
 
-- [ ] Deal created with all mapped properties (not a single blob field)
-- [ ] Contact resolved by email/phone or created when not found
-- [ ] Company resolved by name or created from mentioned_company
-- [ ] Deal ↔ Contact and Deal ↔ Company associations created
-- [ ] Note engagement created with transcript content
-- [ ] Pipeline/stage resolved via API or env overrides
-- [ ] product_version populated even when only in transcript (regex extraction)
+- [x] Deal created with all mapped properties (not a single blob field)
+- [x] Contact resolved by email/phone or created when not found
+- [x] Company resolved by name or created from mentioned_company
+- [x] Deal ↔ Contact and Deal ↔ Company associations created
+- [x] Note engagement created with transcript content
+- [x] Pipeline/stage resolved via API or env overrides
+- [x] product_version populated even when only in transcript (regex extraction)
 
 ### 16.5 UI/UX
 
-- [ ] Audio and text ingestion flows with loading spinners and error handling
-- [ ] All 17 extracted fields displayed in record cards
-- [ ] AI Intelligence dashboard shows KPI cards, pie charts, and intelligence table
-- [ ] Intent badges are color-coded (green/yellow/red)
-- [ ] Risk indicators show icon + color
-- [ ] Deal score displayed as progress bar (0-100)
-- [ ] Tags shown as rounded chip pills
-- [ ] Advanced CRM fields displayed in grid layout
-- [ ] HubSpot sync button with success/error feedback
-- [ ] Responsive design works on mobile
+- [x] Audio and text ingestion flows with loading spinners and error handling
+- [x] All 17 extracted fields displayed in record cards
+- [x] AI Intelligence dashboard shows KPI cards, pie charts, and intelligence table
+- [x] Intent badges are color-coded (green/yellow/red)
+- [x] Risk indicators show icon + color
+- [x] Deal score displayed as progress bar (0-100)
+- [x] Tags shown as rounded chip pills
+- [x] Advanced CRM fields displayed in grid layout
+- [x] HubSpot sync button with success/error feedback
+- [x] Responsive design works on mobile
 
 ---
 
@@ -792,12 +754,16 @@ npm run build  # Production build to dist/
 | Item | Status | Notes |
 |------|--------|-------|
 | Budget misreads (e.g. $99 vs $99,000) | Mitigated | Normalization pipeline handles most cases; edge cases need human review |
-| Accuracy KPIs | Backlog | No built-in batch evaluation against labeled dataset |
-| Native connectors (Gmail, Calendar, telephony) | Backlog | Currently API/UI ingestion only |
+| Accuracy KPIs | Backlog | No built-in batch evaluation against labeled dataset (BRD KPI targets are operational, not auto-reported) |
+| Automatic full inbox / calendar mining | Backlog | Optional Google OAuth supports on-demand Gmail/Calendar actions; not bulk historical sync |
+| Native telephony / CTI | Backlog | API/UI ingestion only |
 | Real-time streaming transcription | Backlog | Batch processing only |
 | Multi-tenant / RBAC | Backlog | Single-instance deployment |
-| Code splitting for frontend bundle | Backlog | Single bundle >500KB; Vite code splitting recommended |
-| Frontend API base URL | Hardcoded | Currently `http://127.0.0.1:8000`; should be env-based for deployment |
+| Code splitting for frontend bundle | Backlog | Vite code splitting recommended for very large bundles |
+
+**Legacy Interaction Mining spec (formerly tracked in a separate status file):** Transcription, NLP extraction, unified CRM history, and analytics are implemented as described in this PRD. Enterprise-grade items (automated accuracy scoring jobs, encryption-at-rest as a product feature, full GDPR tooling) remain out of scope for this POC; see **§18 Out of Scope**.
+
+**Frontend API base URL:** `crm-ui/src/lib/api.js` uses `import.meta.env.VITE_API_URL` when set, otherwise `http://127.0.0.1:8000`. Set `VITE_API_URL` for non-local deployments.
 
 ---
 
@@ -809,7 +775,8 @@ npm run build  # Production build to dist/
 - Enterprise SSO / SAML / RBAC
 - Full GDPR tooling (right to erasure, consent management)
 - ML-based predictive deal forecasting (beyond rule-based scoring)
-- Native email/calendar/telephony integrations (OAuth connectors)
+- Automatic bulk sync of historical email/calendar/telephony into the ingestion pipeline (optional Google OAuth supports on-demand actions only)
+- Native telephony / CTI connectors
 
 ---
 
@@ -825,8 +792,9 @@ ai-crm-system/
 │   ├── BRD_AI_CRM.md               # Business Requirements Document
 │   └── PRD_AI_CRM.md               # Product Requirements Document (this file)
 └── app/
-    ├── main.py                      # FastAPI application factory
+    ├── main.py                      # FastAPI application factory (lifespan: DB + scheduler)
     ├── core/config.py               # Settings and environment loading
+    ├── agents/                      # chat_agent, next_action_agent, followup_agent, tools
     ├── api/
     │   ├── deps.py                  # Database dependency injection
     │   └── routes/
@@ -834,9 +802,12 @@ ai-crm-system/
     │       ├── ingestion.py         # Audio/text/interaction ingestion
     │       ├── extraction.py        # Extraction preview
     │       ├── crm.py               # CRM records CRUD + API models
+    │       ├── records_list.py      # GET /records alias
     │       ├── analytics.py         # Revenue, insights, AI intelligence
     │       ├── interactions.py      # Interaction timeline
-    │       └── hubspot.py           # HubSpot sync endpoint
+    │       ├── hubspot.py           # HubSpot sync endpoint
+    │       ├── agents.py            # Chat, next-action, follow-up
+    │       └── google_workspace.py  # Google OAuth, Gmail, Calendar (optional)
     ├── db/
     │   ├── database.py              # DB engine, init, migrations
     │   ├── models.py                # ORM models (5 tables)
@@ -848,17 +819,23 @@ ai-crm-system/
     │   ├── extraction.py            # Extraction preview models
     │   └── health.py                # Health response model
     ├── services/
-    │   ├── extraction_service.py    # 17-field extraction prompt + builder
-    │   ├── groq_extraction.py       # LLM execution + normalization
+    │   ├── extraction_service.py    # Facts + evaluation prompts; transcript bundle entry
+    │   ├── facts_extraction.py      # Single-pass factual Groq extraction + merge with heuristics
+    │   ├── evaluation_groq.py       # Evaluation from merged facts JSON
+    │   ├── groq_extraction.py       # Pipeline orchestration + legacy field merge
     │   ├── groq_llm.py              # Groq client wrapper
     │   ├── groq_mapping.py          # LLM CRM entity resolution
-    │   ├── groq_speakers.py         # Speaker diarization
-    │   ├── ai_intelligence.py       # 9 AI functions + batch runner
+    │   ├── groq_speakers.py         # Groq/heuristic speaker labeling on segments
+    │   ├── speaker_diarization.py   # Optional pyannote → Speaker A/B
+    │   ├── chat_model.py            # OpenRouter deal chat (requests)
+    │   ├── ai_intelligence.py       # Heuristic AI functions + batch runner
     │   ├── ingestion_pipeline.py    # Full pipeline orchestrator
     │   ├── mapping_service.py       # CRM mapping (LLM + rules)
     │   ├── transcription_service.py # Local Whisper ASR
     │   ├── hubspot_client.py        # HubSpot REST client
-    │   └── hubspot_service.py       # HubSpot sync orchestration
+    │   ├── hubspot_service.py       # HubSpot sync orchestration
+    │   ├── google_service.py        # Google OAuth credential storage and API helpers
+    │   └── scheduler.py             # Background jobs (follow-up reminders, etc.)
     ├── utils/
     │   ├── budget.py                # Budget parsing utility
     │   ├── groq_retry.py            # LLM retry with backoff
@@ -879,8 +856,11 @@ crm-ui/
 ├── eslint.config.js                 # ESLint configuration
 └── src/
     ├── main.jsx                     # React root mount
-    ├── App.jsx                      # Main application (all UI logic)
-    ├── crm-app.css                  # Design system + all component styles
+    ├── App.jsx                      # Routes (Dashboard, Upload, Records, Insights, Timeline, Chat, Settings, Support)
+    ├── components/                  # Layout, Sidebar, TopBar, AIChatbot, GoogleConnect, …
+    ├── pages/                       # Page-level views
+    ├── lib/api.js                   # API base URL + paths (VITE_API_URL)
+    ├── crm-app.css                  # Design system + component styles
     ├── index.css                    # Base styles
     └── App.css                      # Legacy styles
 ```
@@ -893,3 +873,6 @@ crm-ui/
 |---------|------|--------|---------|
 | 1.0 | April 2026 | Engineering | Initial PRD — core ingestion, extraction, HubSpot sync, basic UI |
 | 2.0 | April 15, 2026 | Engineering | Major expansion: 17-field extraction schema with strict rules (budget normalization, intent enum, timeline filtering, product/version separation); AI Intelligence Layer (6 core functions: classify, score, risk, summarize, next action, tag); 6 new advanced CRM fields (mentioned_company, procurement_stage, use_case, decision_criteria, budget_owner, implementation_scope); complete API reference with all 13 endpoints; detailed data model with 33 CrmRecord columns; pipeline architecture documentation; deal scoring formula; classification and risk detection rules; extraction fallback strategy; normalization pipeline; HubSpot field mapping for all new fields; modern SaaS-style UI with design system; comprehensive acceptance criteria |
+| 2.1 | April 18, 2026 | Engineering | Two-phase Groq extraction (facts + evaluation); optional pyannote diarization; OpenRouter deal chat + Groq fallback; `extracted_facts` on ingest responses; docs and README aligned |
+| 2.2 | April 19, 2026 | Engineering | Agents + Google Workspace routes documented; React Router file layout; `GET /api/v1/records` alias; acceptance criteria marked complete; `VITE_API_URL`; removed redundant root status markdown; out-of-scope vs optional Google clarified |
+| 2.3 | April 19, 2026 | Engineering | Reverted sentence-level chunking and separate `chunked_extraction` / ASR cleanup / `extraction_validate` modules; facts phase is one Groq call with optional middle truncation for very long text; pipeline and file tree updated |

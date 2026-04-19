@@ -1,7 +1,7 @@
 """
-Groq LLM execution for CRM extraction: JSON responses and defensive parsing.
+Groq LLM execution for CRM extraction: two-phase pipeline (facts → evaluation).
 
-Prompt construction lives in `extraction_service` (see `build_extraction_prompt`).
+Prompts live in `extraction_service`. Chunking/merge in `facts_extraction`.
 """
 
 from __future__ import annotations
@@ -11,11 +11,8 @@ import logging
 import re
 from typing import Any
 
-from openai import RateLimitError
-
 from app.core.config import settings
 from app.services.groq_llm import get_groq_client
-from app.utils.groq_retry import groq_chat_with_retry
 from app.utils.extraction_refine import (
     refine_budget_core_field,
     refine_company_core_field,
@@ -25,7 +22,6 @@ from app.utils.extraction_refine import (
     refine_timeline_core_field,
 )
 from app.utils.heuristic_extraction import heuristic_extract_entities, merge_extraction_prefer_llm
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_EXTRACTION: dict[str, Any] = {
@@ -48,6 +44,17 @@ DEFAULT_EXTRACTION: dict[str, Any] = {
     "implementation_scope": "",
     "custom_fields": {},
 }
+
+_VALID_INTERACTION = frozenset({"sales", "support", "inquiry", "complaint"})
+_VALID_RISK = frozenset({"low", "medium", "high"})
+_VALID_INTENT = frozenset({"high", "medium", "low"})
+
+
+def _is_na_token(value: Any) -> bool:
+    if value is None:
+        return True
+    s = str(value).strip().lower()
+    return s in ("", "n/a", "na", "none", "null", "unknown")
 
 
 def _strip_markdown_fences(raw: str) -> str:
@@ -76,8 +83,8 @@ def _parse_json_loose(raw: str) -> Any | None:
 
 def _coerce_competitors(value: Any) -> list[str]:
     if isinstance(value, list):
-        return [str(x).strip() for x in value if str(x).strip()]
-    if isinstance(value, str) and value.strip():
+        return [str(x).strip() for x in value if str(x).strip() and not _is_na_token(x)]
+    if isinstance(value, str) and value.strip() and not _is_na_token(value):
         return [c.strip() for c in re.split(r"[,;]", value) if c.strip()]
     return []
 
@@ -90,7 +97,7 @@ def _coerce_custom_fields(value: Any) -> dict[str, str]:
         if i >= 20:
             break
         ks = str(k).strip()
-        if not ks:
+        if not ks or _is_na_token(v):
             continue
         out[ks[:128]] = str(v).strip()[:2048] if v is not None else ""
     return out
@@ -116,9 +123,18 @@ def _unwrap_extraction_payload(data: Any) -> Any:
         if isinstance(inner, dict) and any(
             k in inner
             for k in (
-                "budget", "intent", "product", "industry", "timeline",
-                "competitors", "mentioned_company", "procurement_stage",
-                "use_case", "custom_fields",
+                "budget",
+                "intent",
+                "product",
+                "industry",
+                "timeline",
+                "competitors",
+                "mentioned_company",
+                "procurement_stage",
+                "use_case",
+                "custom_fields",
+                "interaction_type",
+                "deal_score",
             )
         ):
             return inner
@@ -129,9 +145,17 @@ def _is_effectively_empty(norm: dict[str, Any]) -> bool:
     if not isinstance(norm, dict):
         return True
     for key in (
-        "budget", "intent", "product", "timeline", "industry",
-        "mentioned_company", "procurement_stage", "use_case",
-        "decision_criteria", "pain_points", "next_step",
+        "budget",
+        "intent",
+        "product",
+        "timeline",
+        "industry",
+        "mentioned_company",
+        "procurement_stage",
+        "use_case",
+        "decision_criteria",
+        "pain_points",
+        "next_step",
     ):
         if str(norm.get(key) or "").strip():
             return False
@@ -147,17 +171,17 @@ def _is_effectively_empty(norm: dict[str, Any]) -> bool:
 
 def _coerce_string_list(value: Any) -> list[str]:
     if isinstance(value, list):
-        return [str(x).strip() for x in value if x is not None and str(x).strip()]
-    if isinstance(value, str) and value.strip():
+        return [str(x).strip() for x in value if x is not None and str(x).strip() and not _is_na_token(x)]
+    if isinstance(value, str) and value.strip() and not _is_na_token(value):
         return [s.strip() for s in re.split(r"[,;]", value) if s.strip()]
     return []
 
 
 def _coerce_budget(value: Any) -> str:
     """Normalize budget to a clean integer string, or empty."""
-    if value is None:
+    if value is None or _is_na_token(value):
         return ""
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return str(int(value))
     raw = str(value).strip()
     if not raw:
@@ -178,14 +202,15 @@ def _coerce_budget(value: Any) -> str:
             return str(int(float(digits)))
         except (ValueError, OverflowError):
             pass
-    return raw
+    return ""
 
 
 def _coerce_intent(value: Any) -> str:
-    """Normalize intent to exactly 'high', 'medium', or 'low'."""
     raw = str(value or "").strip().lower()
-    if raw in ("high", "medium", "low"):
+    if raw in _VALID_INTENT:
         return raw
+    if _is_na_token(value):
+        return "medium"
     if any(k in raw for k in ("strong", "ready", "commit", "buy", "purchase", "urgent")):
         return "high"
     if any(k in raw for k in ("evaluat", "compar", "consider", "review")):
@@ -194,17 +219,18 @@ def _coerce_intent(value: Any) -> str:
         return "low"
     if raw:
         return "medium"
-    return ""
+    return "medium"
 
 
-def _normalize(data: Any) -> dict[str, Any]:
+def _normalize_extraction_only(data: Any) -> dict[str, Any]:
+    """Normalize legacy extraction-shaped dict to DEFAULT_EXTRACTION layout."""
     out = dict(DEFAULT_EXTRACTION)
     data = _unwrap_extraction_payload(data)
     if not isinstance(data, dict):
         return out
 
     out["budget"] = _coerce_budget(data.get("budget"))
-    out["intent"] = _coerce_intent(data.get("intent")) or "medium"
+    out["intent"] = _coerce_intent(data.get("intent"))
     out["product"] = str(data.get("product") or "").strip()
     out["product_version"] = str(data.get("product_version") or "").strip()
     out["timeline"] = str(data.get("timeline") or "").strip()
@@ -232,52 +258,165 @@ def _normalize(data: Any) -> dict[str, Any]:
     return out
 
 
-def _run_groq_extraction_attempt(
-    full_prompt: str,
-    *,
-    json_mode: bool,
-) -> tuple[dict[str, Any], bool, bool]:
-    """
-    Returns (normalized dict, success, rate_limit_skip_followup).
+def _scalar_from_llm(value: Any) -> str:
+    if _is_na_token(value):
+        return ""
+    if isinstance(value, list):
+        return "; ".join(str(x).strip() for x in value if str(x).strip())[:1024]
+    return str(value).strip()
 
-    If rate_limit_skip_followup is True, skip a second LLM extraction attempt (429 after retries).
+
+def facts_eval_to_extracted_and_ai(
+    merged_facts: dict[str, Any],
+    ev: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Combine factual JSON + evaluation JSON into legacy extraction + ai_intelligence shapes."""
+    ex: dict[str, Any] = dict(DEFAULT_EXTRACTION)
+    ent = merged_facts.get("entities") if isinstance(merged_facts.get("entities"), dict) else {}
+
+    b_raw = ent.get("budget")
+    if _is_na_token(b_raw):
+        ex["budget"] = ""
+    else:
+        ex["budget"] = _coerce_budget(b_raw)
+
+    ex["mentioned_company"] = _scalar_from_llm(ent.get("mentioned_company"))
+    ex["product"] = _scalar_from_llm(ent.get("product"))
+    ex["product_version"] = _scalar_from_llm(ent.get("product_version"))
+    ex["competitors"] = _coerce_competitors(ent.get("competitors"))
+    ex["industry"] = _scalar_from_llm(ent.get("industry"))
+    ex["timeline"] = _scalar_from_llm(ent.get("timeline"))
+    ex["stakeholders"] = _coerce_string_list(ent.get("stakeholders"))
+    ex["procurement_stage"] = _scalar_from_llm(ent.get("procurement_stage"))[:128]
+    ex["use_case"] = _scalar_from_llm(ent.get("use_case"))
+    ex["decision_criteria"] = _scalar_from_llm(ent.get("decision_criteria"))
+    ex["budget_owner"] = _scalar_from_llm(ent.get("budget_owner"))[:256]
+    ex["implementation_scope"] = _scalar_from_llm(ent.get("implementation_scope"))[:256]
+    ex["custom_fields"] = _coerce_custom_fields(ent.get("custom_fields"))
+
+    ex["intent"] = _coerce_intent(ev.get("intent"))
+    ex["pain_points"] = _scalar_from_llm(ev.get("pain_points"))
+    ex["next_step"] = _scalar_from_llm(ev.get("next_step"))
+    ex["urgency_reason"] = _scalar_from_llm(ev.get("urgency_reason"))
+
+    it = str(ev.get("interaction_type") or "inquiry").strip().lower()
+    if it not in _VALID_INTERACTION:
+        it = "inquiry"
+    try:
+        ds = int(ev.get("deal_score", 0))
+    except (TypeError, ValueError):
+        ds = 0
+    ds = max(0, min(100, ds))
+    rl = str(ev.get("risk_level") or "low").strip().lower()
+    if rl not in _VALID_RISK:
+        rl = "low"
+    next_action = _scalar_from_llm(ev.get("next_action"))[:2048]
+    w = next_action.split()
+    if len(w) > 12:
+        next_action = " ".join(w[:12])
+
+    tags_raw = ev.get("tags")
+    tags: list[str] = []
+    if isinstance(tags_raw, list):
+        for t in tags_raw[:16]:
+            s = str(t).strip().lower().replace(" ", "-")
+            if s and not _is_na_token(s) and s not in tags:
+                tags.append(s[:64])
+    tags = tags[:8]
+
+    ai = {
+        "interaction_type": it,
+        "deal_score": ds,
+        "risk_level": rl,
+        "risk_reason": _scalar_from_llm(ev.get("risk_reason"))[:2048],
+        "summary": _scalar_from_llm(ev.get("summary"))[:4096],
+        "next_action": next_action,
+        "tags": tags,
+    }
+    return ex, ai
+
+
+def _augment_merged_facts(merged_facts: dict[str, Any], src: str) -> dict[str, Any]:
+    """Fill sparse factual output with rule-based hints (same transcript; no extra LLM)."""
+    from app.services.facts_extraction import heuristics_facts_from_transcript, merge_facts_payloads
+
+    h = heuristics_facts_from_transcript(src)
+    return merge_facts_payloads([merged_facts, h])
+
+
+def _finalize_two_phase(
+    src: str,
+    merged_facts: dict[str, Any],
+    eval_block: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Heuristic merge, refiners, run_ai_intelligence."""
+    from app.services.ai_intelligence import run_ai_intelligence
+
+    llm_ex, llm_ai = facts_eval_to_extracted_and_ai(merged_facts, eval_block)
+    heur = heuristic_extract_entities(src)
+    merged = merge_extraction_prefer_llm(llm_ex, heur)
+    refine_budget_core_field(merged, src)
+    if not str(merged.get("intent") or "").strip():
+        merged["intent"] = "medium"
+    refine_company_core_field(merged, src)
+    refine_product_industry_fields(merged, src)
+    refine_product_core_field(merged, src)
+    refine_timeline_core_field(merged, src)
+    enrich_map_version_custom_field(merged, src)
+    ai = run_ai_intelligence(src, merged, llm_primary=llm_ai)
+    return merged, ai, merged_facts
+
+
+def _heuristic_fallback_pipeline(src: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """No Groq: heuristic facts + deterministic evaluation."""
+    from app.services.evaluation_groq import deterministic_evaluation
+    from app.services.facts_extraction import default_facts_payload, heuristics_facts_from_transcript
+
+    facts = heuristics_facts_from_transcript(src)
+    ev = deterministic_evaluation(facts)
+    merged, ai, mf = _finalize_two_phase(src, facts, ev)
+    return merged, ai, mf
+
+
+def run_transcript_extraction_pipeline(transcript: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """
-    if not (settings.groq_model or "").strip():
-        logger.error("GROQ_MODEL is not set")
-        return dict(DEFAULT_EXTRACTION), False, False
+    transcript → facts (single Groq call) → merge with heuristics → evaluation.
+
+    Returns (extracted_entities, ai_intelligence, merged_extracted_facts).
+    """
+    from app.services.ai_intelligence import run_ai_intelligence
+    from app.services.evaluation_groq import deterministic_evaluation, run_evaluation_groq
+    from app.services.facts_extraction import (
+        default_facts_payload,
+        run_facts_extraction,
+    )
+
+    src = (transcript or "").strip()
+    if not src:
+        empty_ex = dict(DEFAULT_EXTRACTION)
+        ai = run_ai_intelligence("", empty_ex, llm_primary=None)
+        return empty_ex, ai, default_facts_payload()
 
     try:
-        raw = groq_chat_with_retry(full_prompt, json_mode=json_mode, max_attempts=3)
-    except RateLimitError as e:
-        logger.warning(
-            "Groq extraction rate limited after retries; using heuristic fallback if needed: %s",
-            e,
-        )
-        return dict(DEFAULT_EXTRACTION), False, True
-    except Exception:
-        logger.exception("Groq extraction request failed (json_mode=%s)", json_mode)
-        return dict(DEFAULT_EXTRACTION), False, False
+        get_groq_client()
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return _heuristic_fallback_pipeline(src)
 
-    if not raw:
-        logger.warning("Groq returned empty extraction text (json_mode=%s)", json_mode)
-        return dict(DEFAULT_EXTRACTION), False, False
+    merged_facts = run_facts_extraction(src)
+    merged_facts = _augment_merged_facts(merged_facts, src)
 
-    parsed = _parse_json_loose(raw)
-    if parsed is None:
-        logger.warning(
-            "Failed to parse Groq extraction as JSON (json_mode=%s); raw prefix: %s",
-            json_mode,
-            raw[:1200] if raw else "",
-        )
-        return dict(DEFAULT_EXTRACTION), False, False
+    ev = run_evaluation_groq(merged_facts)
+    if ev is None:
+        ev = deterministic_evaluation(merged_facts)
 
-    return _normalize(parsed), True, False
+    return _finalize_two_phase(src, merged_facts, ev)
 
 
-def _transcript_from_prompt(full_prompt: str) -> str:
-    if "Conversation:\n" in full_prompt:
-        return full_prompt.split("Conversation:\n", 1)[-1].strip()
-    return ""
+def run_unified_extraction(transcript: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Backward-compatible 2-tuple wrapper around the two-phase pipeline."""
+    ex, ai, _ = run_transcript_extraction_pipeline(transcript)
+    return ex, ai
 
 
 def execute_groq_json_extraction(
@@ -285,63 +424,14 @@ def execute_groq_json_extraction(
     *,
     source_transcript: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Send `full_prompt` to Groq and return normalized extraction dict.
+    """Returns extraction dict only (backward-compatible)."""
+    src = (source_transcript or "").strip()
+    if not src and "--- TRANSCRIPT ---" in full_prompt:
+        src = full_prompt.split("--- TRANSCRIPT ---", 1)[-1].strip()
+    entities, _, _ = run_transcript_extraction_pipeline(src)
+    return entities
 
-    On missing configuration, API errors, or invalid JSON, merges heuristic fallback where useful.
-    """
-    src_early = (source_transcript or _transcript_from_prompt(full_prompt) or "").strip()
 
-    if not full_prompt or not full_prompt.strip():
-        return merge_extraction_prefer_llm(dict(DEFAULT_EXTRACTION), heuristic_extract_entities(src_early))
-
-    try:
-        get_groq_client()
-    except RuntimeError as exc:
-        logger.error("%s", exc)
-        return merge_extraction_prefer_llm(dict(DEFAULT_EXTRACTION), heuristic_extract_entities(src_early))
-
-    first, ok, rl_skip = _run_groq_extraction_attempt(full_prompt, json_mode=True)
-
-    if rl_skip:
-        llm_out = first
-    elif ok and not _is_effectively_empty(first):
-        llm_out = first
-    else:
-        llm_out = first
-        if ok and _is_effectively_empty(first):
-            logger.warning(
-                "Groq JSON-mode extraction returned only empty fields; retrying without JSON schema",
-            )
-        fallback_prompt = (
-            full_prompt
-            + "\n\nReply with ONLY a single JSON object matching the format above. "
-            "No markdown fences, no commentary."
-        )
-        second, ok2, rl2 = _run_groq_extraction_attempt(
-            fallback_prompt,
-            json_mode=False,
-        )
-        if not rl2:
-            if ok2 and not _is_effectively_empty(second):
-                llm_out = second
-            elif ok and not _is_effectively_empty(first):
-                llm_out = first
-            else:
-                llm_out = second if ok2 else first
-
-    heur = heuristic_extract_entities(src_early)
-    merged = merge_extraction_prefer_llm(llm_out, heur)
-    refine_budget_core_field(merged, src_early)
-    if not str(merged.get("intent") or "").strip():
-        merged["intent"] = "medium"
-    refine_company_core_field(merged, src_early)
-    refine_product_industry_fields(merged, src_early)
-    refine_product_core_field(merged, src_early)
-    refine_timeline_core_field(merged, src_early)
-    enrich_map_version_custom_field(merged, src_early)
-    if _is_effectively_empty(llm_out) and not _is_effectively_empty(merged):
-        logger.info(
-            "Filled CRM fields from heuristic fallback (Groq unavailable, empty, or rate limited)",
-        )
-    return merged
+def _normalize(data: Any) -> dict[str, Any]:
+    """Public alias used by tests / imports — same as extraction-only normalize."""
+    return _normalize_extraction_only(data)

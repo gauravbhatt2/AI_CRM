@@ -111,6 +111,7 @@ class CrmRecord(Base):
         server_default=text("'[]'::jsonb"),
     )
     next_action: Mapped[str] = mapped_column(Text, default="", server_default="")
+    followup_email: Mapped[str] = mapped_column(Text, default="", server_default="")
     product_version: Mapped[str] = mapped_column(String(256), default="", server_default="")
     pain_points: Mapped[str] = mapped_column(Text, default="", server_default="")
     next_step: Mapped[str] = mapped_column(Text, default="", server_default="")
@@ -140,6 +141,24 @@ class CrmRecord(Base):
     account: Mapped["Account | None"] = relationship(back_populates="crm_records")
     contact: Mapped["Contact | None"] = relationship(back_populates="crm_records")
     deal: Mapped["Deal | None"] = relationship(back_populates="crm_records")
+
+
+class OAuthCredential(Base):
+    """Stores Google OAuth credentials (mailNDcalendar)."""
+
+    __tablename__ = "oauth_credentials"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_identifier: Mapped[str] = mapped_column(
+        String(256), unique=True, index=True, nullable=False, default="global_system_user"
+    )
+    token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    client_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    client_secret: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    scopes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extracted_email: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
 
 class AuditLog(Base):

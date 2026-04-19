@@ -188,6 +188,14 @@ _VALID_RISK_LEVEL = {"low", "medium", "high"}
 _VALID_INTERACTION_TYPE = {"sales", "support", "inquiry", "complaint"}
 
 
+def _hubspot_omit_value(value: str) -> bool:
+    """Skip empty or LLM sentinel placeholders (aligned with unified extraction)."""
+    s = (value or "").strip()
+    if not s:
+        return True
+    return s.lower() in ("n/a", "na", "none", "null", "unknown")
+
+
 def _deal_properties_from_record(record: Any, token: str) -> dict[str, str]:
     """Build HubSpot deal properties using ONLY the supported custom properties.
 
@@ -220,11 +228,11 @@ def _deal_properties_from_record(record: Any, token: str) -> dict[str, str]:
         props["intent"] = intent
 
     timeline = str(getattr(record, "timeline", "") or "").strip()
-    if timeline:
+    if timeline and not _hubspot_omit_value(timeline):
         props["timeline"] = timeline[:65000]
 
     raw_product = str(getattr(record, "product", "") or "").strip()
-    if raw_product:
+    if raw_product and not _hubspot_omit_value(raw_product):
         clean_prod, _ = clean_product_for_hubspot(raw_product)
         if clean_prod:
             props["product"] = clean_prod
@@ -238,15 +246,15 @@ def _deal_properties_from_record(record: Any, token: str) -> dict[str, str]:
         props["risk_level"] = risk_level
 
     next_action = str(getattr(record, "next_action", "") or "").strip()
-    if next_action:
+    if next_action and not _hubspot_omit_value(next_action):
         props["next_action"] = next_action[:65000]
 
     summary = str(getattr(record, "summary", "") or "").strip()
-    if summary:
+    if summary and not _hubspot_omit_value(summary):
         props["summary"] = summary[:65000]
 
     pain_points = str(getattr(record, "pain_points", "") or "").strip()
-    if pain_points:
+    if pain_points and not _hubspot_omit_value(pain_points):
         props["pain_points"] = pain_points[:65000]
 
     interaction_type = str(getattr(record, "interaction_type", "") or "").strip().lower()
@@ -254,7 +262,7 @@ def _deal_properties_from_record(record: Any, token: str) -> dict[str, str]:
         props["interaction_type"] = interaction_type
 
     mentioned_company = str(getattr(record, "mentioned_company", "") or "").strip()
-    if mentioned_company:
+    if mentioned_company and not _hubspot_omit_value(mentioned_company):
         props["mentioned_company"] = mentioned_company[:65000]
 
     return props

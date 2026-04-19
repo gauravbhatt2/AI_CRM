@@ -20,13 +20,28 @@ from app.db.crm_record_repository import (
     update_crm_record_content,
     update_crm_record_structured_transcript,
 )
-from app.services.groq_speakers import label_segment_speakers
+from app.services.groq_speakers import (
+    heuristic_speaker_segments,
+    label_segment_speakers,
+    maybe_relabel_speakers_ab,
+)
 from app.services.ingestion_pipeline import build_audio_ingest_response, run_transcript_pipeline
+from app.services.speaker_diarization import apply_pyannote_to_segments
 from app.services.transcription_service import (
     FfmpegRequiredError,
     WhisperNotInstalledError,
     transcribe_audio_detailed,
 )
+
+
+def _rebuild_plain_text_from_segments(segments: list[dict]) -> str:
+    parts = [str(s.get("text") or "").strip() for s in segments if isinstance(s, dict)]
+    return " ".join(p for p in parts if p).strip()
+
+
+def _copy_segments(segments: list) -> list[dict]:
+    return [dict(s) for s in segments if isinstance(s, dict)]
+
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
 
@@ -156,14 +171,24 @@ async def ingest_audio(
         except FfmpegRequiredError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
 
-        plain = (detail.get("plain_text") or "").strip()
+        segments = _copy_segments(detail.get("segments") or [])
+        pyannote_applied = False
+        try:
+            segments, pyannote_applied = await asyncio.to_thread(
+                apply_pyannote_to_segments,
+                tmp_path,
+                segments,
+            )
+        except Exception:
+            pyannote_applied = False
+
+        plain = _rebuild_plain_text_from_segments(segments).strip() or (detail.get("plain_text") or "").strip()
         if not plain:
             raise HTTPException(
                 status_code=422,
                 detail="Transcription was empty. Check audio quality or format (FFmpeg may be required).",
             )
 
-        segments = detail.get("segments") or []
         structured = StructuredTranscript(plain_text=plain, segments=segments or [])
 
         base = await run_transcript_pipeline(
@@ -177,9 +202,15 @@ async def ingest_audio(
         )
 
         out_structured = structured
-        if settings.groq_label_speakers and segments:
+        if segments:
             try:
-                labeled = await asyncio.to_thread(label_segment_speakers, segments)
+                if pyannote_applied:
+                    labeled = [dict(s) for s in segments]
+                elif settings.groq_label_speakers:
+                    labeled = await asyncio.to_thread(label_segment_speakers, segments)
+                else:
+                    labeled = await asyncio.to_thread(heuristic_speaker_segments, segments)
+                labeled = maybe_relabel_speakers_ab(labeled or segments)
                 out_structured = StructuredTranscript(
                     plain_text=plain,
                     segments=labeled or segments,

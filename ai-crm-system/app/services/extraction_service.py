@@ -1,149 +1,146 @@
 """
 Business logic for AI-powered field extraction from transcripts.
 
-Prompt text lives here; Groq execution and JSON parsing live in `groq_extraction`.
+Two-phase pipeline (see `groq_extraction.run_transcript_extraction_pipeline`):
+1) Facts-only extraction — single Groq call on the transcript (truncated if extremely long)
+2) Evaluation from merged facts only (Groq JSON)
 """
+
+from __future__ import annotations
 
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Extraction prompt — strict 17-field CRM schema
+# Phase 1 — factual extraction only (no intent, pain, scoring)
 # ---------------------------------------------------------------------------
 
-EXTRACTION_PROMPT_TEMPLATE = """You are a precision CRM extraction engine for noisy Whisper transcripts.
-Read the conversation carefully and return ONE flat JSON object with exactly the 17 keys listed.
+FACTS_EXTRACTION_PROMPT_TEMPLATE = """You extract ONLY factual information from conversation text.
 
-ABSOLUTE RULES:
-1) Return STRICT JSON only. No markdown, no prose, no code fences.
-2) Use only evidence from the conversation. Never infer facts that are not stated.
-3) If a field is missing, ambiguous, or conflicting, return null (or [] for array fields).
-4) Include every required key exactly once. Do not add extra keys.
-5) Keep values concise and CRM-ready (short phrases, not paragraphs).
+OUTPUT: One JSON object only. No markdown fences, no commentary.
 
-CONFIDENCE AND EVIDENCE:
-- Prefer precision over coverage: leave unknown fields null.
-- Do not invent names, titles, companies, numbers, dates, or stages.
-- If multiple possibilities exist and no clear winner is stated, return null.
+RULES:
+- No interpretation, opinion, or inference beyond what is explicitly stated.
+- Do NOT output intent, pain_points, deal_score, risk, summary, or next_action.
+- Quote or closely paraphrase important lines as factual "statements" (key claims, numbers, names, commitments).
+- "entities" holds normalized factual fields (company, product, budget, etc.).
+- "participants": people or roles named (e.g. "Jane", "VP Sales") when stated.
+- "timestamps": only if the text includes explicit times/dates; else []. Each item: {{"label": "string", "start_sec": number|null, "end_sec": number|null}} or use {{"note": "Q4 2025"}} when wall-clock unknown.
 
-WHISPER / ASR HANDLING:
-- Transcript may contain filler words, minor transcription errors, and missing punctuation.
-- Normalize obvious ASR noise before extraction (e.g., repeated words, disfluencies).
-- Use context from surrounding lines to resolve entity boundaries.
-- If speaker labels or timestamps appear, use them as context only; do not copy timestamps into values.
-- Never include trailing connector words in entities (e.g., "Novagen is" must become "Novagen").
+MISSING: use "n/a" for unknown string fields; budget use integer when clearly stated else "n/a"; arrays empty when absent.
 
-FIELD RULES:
-- budget:
-  - Return integer only (no symbols, commas, words).
-  - Valid conversions: "$75,000" -> 75000, "50k" -> 50000, "1.2M" -> 1200000.
-  - If plain currency amount appears (e.g., "$99", "99 dollars"), keep exact value (99).
-  - For consumer automotive map-update calls, if ASR produces "$99,000" but nearby context includes promotions like "$50 off" and shipping/tax, normalize to 99.
-  - If only vague wording exists (e.g., "six figures", "large budget"), return null.
-- intent:
-  - Must be exactly one of "high", "medium", "low".
-  - high = clear commitment or purchase readiness.
-  - medium = active evaluation/comparison with next steps.
-  - low = exploratory discussion with no urgency/commitment.
-  - If unclear, use "medium".
-- timeline:
-  - Capture only decision/implementation timeline.
-  - Ignore shipping/delivery/admin scheduling.
-  - If absent, return null.
-- product and product_version:
-  - product = clean product/service name only.
-  - product_version = version only (examples: "7.7", "2024.1"), else null.
-  - Never place version text inside product.
-- competitors:
-  - Array of competitor company names only.
-  - Normalize casing to proper names and deduplicate.
-- stakeholders:
-  - Array of names or role titles involved in decision/approval.
-  - Prefer "Name (Role)" when both are present.
-  - Do not include generic words like "team" unless explicitly the only reference.
-- next_step:
-  - Must be a concrete agreed action (meeting, demo, proposal, follow-up), not a wish.
-- procurement_stage:
-  - Use only if clearly stated/implied by explicit evidence (e.g., "evaluation", "negotiation", "legal review", "budget approved").
-  - Otherwise null.
-
-OUTPUT SCHEMA (EXACT KEYS ONLY):
+REQUIRED SHAPE:
 {
-  "budget": null,
-  "intent": "medium",
-  "timeline": null,
-  "product": null,
-  "product_version": null,
-  "competitors": [],
-  "industry": null,
-  "pain_points": null,
-  "next_step": null,
-  "urgency_reason": null,
-  "stakeholders": [],
-  "mentioned_company": null,
-  "procurement_stage": null,
-  "use_case": null,
-  "decision_criteria": null,
-  "budget_owner": null,
-  "implementation_scope": null
+  "statements": [],
+  "entities": {
+    "mentioned_company": "n/a",
+    "product": "n/a",
+    "product_version": "n/a",
+    "budget": "n/a",
+    "competitors": [],
+    "industry": "n/a",
+    "timeline": "n/a",
+    "stakeholders": [],
+    "procurement_stage": "n/a",
+    "use_case": "n/a",
+    "decision_criteria": "n/a",
+    "budget_owner": "n/a",
+    "implementation_scope": "n/a",
+    "custom_fields": {}
+  },
+  "participants": [],
+  "timestamps": []
 }
 
-Field definitions:
-  budget               -> integer or null
-  intent               -> "high" | "medium" | "low"
-  timeline             -> decision/implementation timeline phrase, or null
-  product              -> product/service name, or null
-  product_version      -> version string, or null
-  competitors          -> array of competitor names
-  industry             -> industry vertical, or null
-  pain_points          -> main customer problems, single concise string, or null
-  next_step            -> concrete agreed next action, or null
-  urgency_reason       -> reason for urgency/time pressure, or null
-  stakeholders         -> array of decision participants (names/roles; use "Name (Role)" when possible)
-  mentioned_company    -> customer company name, or null
-  procurement_stage    -> buying stage, or null
-  use_case             -> intended usage, or null
-  decision_criteria    -> key evaluation criteria, or null
-  budget_owner         -> person/role controlling budget, or null
-  implementation_scope -> rollout scope, or null
-
-Conversation:
+--- TRANSCRIPT ---
 {transcript}"""
 
-# Avoid huge prompts starving JSON output or hitting edge cases with JSON mode.
+# ---------------------------------------------------------------------------
+# Phase 2 — evaluation from merged facts JSON only (no raw transcript)
+# ---------------------------------------------------------------------------
+
+EVALUATION_PROMPT_TEMPLATE = """You evaluate a sales/support interaction using ONLY the JSON object below (merged factual extraction). Do not invent details not supported by these facts.
+
+OUTPUT: One JSON object only. No markdown fences, no commentary.
+
+If evidence is insufficient for a field, use "n/a", 0, or [] as appropriate.
+
+REQUIRED KEYS:
+{
+  "intent": "high|medium|low",
+  "pain_points": "n/a",
+  "next_step": "n/a",
+  "next_action": "n/a",
+  "risk_level": "low|medium|high",
+  "risk_reason": "n/a",
+  "deal_score": 0,
+  "interaction_type": "sales|support|inquiry|complaint",
+  "summary": "n/a",
+  "tags": [],
+  "urgency_reason": "n/a"
+}
+
+Rules:
+- next_action: max 12 words, imperative verb first.
+- summary: brief (one or two sentences), grounded in the facts only.
+
+MERGED_FACTS_JSON:
+{merged_facts}"""
+
 TRANSCRIPT_LLM_MAX_CHARS = 120_000
 
 
-def build_extraction_prompt(transcript: str) -> str:
-    """Build the user message for Groq from the template and transcript."""
-    t = transcript.strip()
+def build_facts_extraction_prompt(transcript: str) -> str:
+    t = (transcript or "").strip()
     if len(t) > TRANSCRIPT_LLM_MAX_CHARS:
         t = (
             t[: TRANSCRIPT_LLM_MAX_CHARS // 2]
-            + "\n\n[... middle of transcript omitted for length ...]\n\n"
+            + "\n\n[... middle omitted for length ...]\n\n"
             + t[-(TRANSCRIPT_LLM_MAX_CHARS // 2) :]
         )
-    return EXTRACTION_PROMPT_TEMPLATE.replace("{transcript}", t)
+    return FACTS_EXTRACTION_PROMPT_TEMPLATE.replace("{transcript}", t)
+
+
+def build_evaluation_prompt(merged_facts_json: str) -> str:
+    return EVALUATION_PROMPT_TEMPLATE.replace("{merged_facts}", (merged_facts_json or "").strip()[:28000])
+
+
+def build_unified_extraction_prompt(transcript: str) -> str:
+    """Backward-compatible alias: facts-only prompt (same as phase 1)."""
+    return build_facts_extraction_prompt(transcript)
+
+
+def build_extraction_prompt(transcript: str) -> str:
+    """Backward-compatible alias."""
+    return build_facts_extraction_prompt(transcript)
+
+
+def extract_transcript_bundle(
+    text: str, context: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Run two-phase pipeline (facts + evaluation); returns (extracted_entities, ai_intelligence, merged_extracted_facts)."""
+    _ = context
+    from app.services.groq_extraction import run_transcript_extraction_pipeline
+
+    return run_transcript_extraction_pipeline(text)
 
 
 def extract_entities(text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Extract CRM-oriented entities via Groq using `build_extraction_prompt`."""
-    _ = context
-    from app.services.groq_extraction import execute_groq_json_extraction
-
-    return execute_groq_json_extraction(
-        build_extraction_prompt(text),
-        source_transcript=text,
-    )
+    """Extract CRM fields (same shape as before); facts bundle available via extract_transcript_bundle."""
+    entities, _, _ = extract_transcript_bundle(text, context=context)
+    return entities
 
 
 class ExtractionService:
     """Coordinates extraction from normalized text via Groq."""
 
     def extract_entities(self, text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Extract CRM-oriented entities; `context` reserved for future use."""
         return extract_entities(text, context=context)
 
     def preview(self, text: str) -> dict[str, Any]:
-        """Dry-run extraction for API previews."""
-        entities = extract_entities(text)
-        return {"text_length": len(text), "entities": entities}
+        entities, ai, facts = extract_transcript_bundle(text)
+        return {
+            "text_length": len(text),
+            "entities": entities,
+            "ai_intelligence": ai,
+            "extracted_facts": facts,
+        }

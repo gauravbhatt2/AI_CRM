@@ -31,11 +31,15 @@ def groq_chat_completion(
     prompt: str,
     *,
     json_mode: bool = True,
-    temperature: float = 0.2,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
     max_tokens: int = 4096,
     model: str | None = None,
 ) -> str:
-    """Single chat completion; returns assistant message text."""
+    """Single chat completion; returns assistant message text.
+
+    Defaults favor reproducibility (temperature 0, top_p 1) for extraction tasks.
+    """
     m = (model or settings.groq_model or "").strip()
     if not m:
         raise RuntimeError("GROQ_MODEL is not set")
@@ -44,6 +48,7 @@ def groq_chat_completion(
         "model": m,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
+        "top_p": top_p,
         "max_tokens": max_tokens,
     }
     if json_mode:

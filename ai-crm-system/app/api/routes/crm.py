@@ -2,11 +2,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.db.models import CrmRecord
+from app.db.models import Account, Contact, CrmRecord, Deal
 from app.models.crm import CRMMapRequest, CRMMapResponse
 from app.services.mapping_service import MappingService
 from app.utils.budget import parse_budget_to_int
@@ -79,6 +79,7 @@ class CrmRecordOut(BaseModel):
     summary: str = ""
     tags: list[str] = Field(default_factory=list)
     next_action: str = ""
+    followup_email: str = ""
     pain_points: str = ""
     next_step: str = ""
     urgency_reason: str = ""
@@ -181,6 +182,7 @@ def _to_crm_record_out(row: CrmRecord) -> CrmRecordOut:
         summary=getattr(row, "summary", "") or "",
         tags=_competitors_for_api(getattr(row, "tags", None)),
         next_action=getattr(row, "next_action", "") or "",
+        followup_email=str(getattr(row, "followup_email", "") or ""),
         pain_points=str(getattr(row, "pain_points", "") or ""),
         next_step=getattr(row, "next_step", "") or "",
         urgency_reason=getattr(row, "urgency_reason", "") or "",
@@ -245,15 +247,53 @@ def patch_crm_record(
 
 
 class DeleteRecordsResponse(BaseModel):
-    deleted: int = Field(..., description="Number of rows removed from crm_records")
+    deleted_records: int = Field(..., description="Rows removed from crm_records")
+    deleted_contacts: int = Field(0, description="Rows removed from contacts")
+    deleted_deals: int = Field(0, description="Rows removed from deals")
+    deleted_accounts: int = Field(0, description="Rows removed from accounts")
+
+
+def _restart_id_sequences_after_delete(db: Session) -> None:
+    """Reset autoincrement/serial counters so the next inserted row uses id=1 (Postgres/SQLite)."""
+    bind = db.get_bind()
+    if bind is None:
+        return
+    dialect = bind.dialect.name
+    if dialect == "postgresql":
+        for table in ("crm_records", "accounts", "contacts", "deals"):
+            db.execute(text(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), 1, false)"))
+        return
+    if dialect == "sqlite":
+        try:
+            db.execute(
+                text(
+                    "DELETE FROM sqlite_sequence WHERE name IN "
+                    "('crm_records', 'accounts', 'contacts', 'deals')"
+                )
+            )
+        except Exception:
+            pass
 
 
 @router.delete("/records", response_model=DeleteRecordsResponse)
 def delete_all_crm_records(db: Session = Depends(get_db)) -> DeleteRecordsResponse:
-    """Remove every row from `crm_records` (destructive; use for local reset)."""
-    result = db.execute(delete(CrmRecord))
+    """
+    Remove all CRM data: records first, then contacts/deals/accounts, then restart id sequences.
+
+    Destructive — intended for local/dev reset so new entities start at id 1.
+    """
+    n_rec = int(db.execute(delete(CrmRecord)).rowcount or 0)
+    n_cont = int(db.execute(delete(Contact)).rowcount or 0)
+    n_deal = int(db.execute(delete(Deal)).rowcount or 0)
+    n_acc = int(db.execute(delete(Account)).rowcount or 0)
+    _restart_id_sequences_after_delete(db)
     db.commit()
-    return DeleteRecordsResponse(deleted=int(result.rowcount or 0))
+    return DeleteRecordsResponse(
+        deleted_records=n_rec,
+        deleted_contacts=n_cont,
+        deleted_deals=n_deal,
+        deleted_accounts=n_acc,
+    )
 
 
 @router.post("/map", response_model=CRMMapResponse)

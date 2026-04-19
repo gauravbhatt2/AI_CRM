@@ -206,6 +206,20 @@ def _ensure_crm_records_ai_intelligence_columns(engine: Engine) -> None:
             conn.execute(text(s))
 
 
+def _ensure_crm_records_followup_email_column(engine: Engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE crm_records
+                ADD COLUMN IF NOT EXISTS followup_email TEXT NOT NULL DEFAULT ''
+                """
+            )
+        )
+
+
 def init_db() -> None:
     """Create all tables defined on Base (idempotent) and align legacy schema."""
     init_engine()
@@ -221,3 +235,4 @@ def init_db() -> None:
     _ensure_deals_stage_columns(_engine)
     _ensure_crm_records_interaction_columns(_engine)
     _ensure_crm_records_ai_intelligence_columns(_engine)
+    _ensure_crm_records_followup_email_column(_engine)
