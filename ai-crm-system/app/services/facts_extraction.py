@@ -282,7 +282,7 @@ def _normalize_facts_shape(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _run_single_facts_attempt(prompt: str) -> tuple[dict[str, Any] | None, bool]:
+def _run_single_facts_attempt(prompt: str, *, temperature: float = 0.0) -> tuple[dict[str, Any] | None, bool]:
     if not (settings.groq_model or "").strip():
         return None, False
     try:
@@ -290,7 +290,7 @@ def _run_single_facts_attempt(prompt: str) -> tuple[dict[str, Any] | None, bool]
             prompt,
             json_mode=True,
             max_attempts=3,
-            temperature=0.0,
+            temperature=temperature,
             top_p=1.0,
             max_tokens=8192,
         )
@@ -308,14 +308,89 @@ def _run_single_facts_attempt(prompt: str) -> tuple[dict[str, Any] | None, bool]
     return _normalize_facts_shape(parsed), True
 
 
+_SC_AMBIGUOUS_FIELDS: frozenset[str] = frozenset(
+    {"budget", "product", "product_version", "timeline", "procurement_stage", "implementation_scope"}
+)
+
+
+def _reconcile_facts_consistency(primary: dict[str, Any], alternate: dict[str, Any]) -> dict[str, Any]:
+    """
+    Merge two facts payloads with disagreement-aware reconciliation on ambiguous fields.
+
+    - Agreement -> keep primary value.
+    - Disagreement -> blank the field (prefer "n/a" + logged).
+    - One is "n/a" and the other isn't -> keep the non-empty value.
+    - Lists (competitors/stakeholders) -> union via existing merge_facts_payloads.
+    """
+    merged = merge_facts_payloads([primary, alternate])
+    ent_p = primary.get("entities") if isinstance(primary.get("entities"), dict) else {}
+    ent_a = alternate.get("entities") if isinstance(alternate.get("entities"), dict) else {}
+    ent_m = merged.get("entities") if isinstance(merged.get("entities"), dict) else {}
+
+    def _norm(v: Any) -> str:
+        return str(v or "").strip().lower()
+
+    disagreements: list[str] = []
+    for f in _SC_AMBIGUOUS_FIELDS:
+        vp = ent_p.get(f)
+        va = ent_a.get(f)
+        np_ = _norm(vp)
+        na_ = _norm(va)
+        if not np_ and not na_:
+            continue
+        if np_ in ("n/a", "na", "none") and na_ in ("n/a", "na", "none", ""):
+            ent_m[f] = "" if f == "budget" else "n/a"
+            continue
+        if not np_ or np_ in ("n/a", "na", "none"):
+            ent_m[f] = va if isinstance(va, (int, float)) else (str(va) if va is not None else "")
+            continue
+        if not na_ or na_ in ("n/a", "na", "none"):
+            ent_m[f] = vp if isinstance(vp, (int, float)) else (str(vp) if vp is not None else "")
+            continue
+        if np_ == na_:
+            ent_m[f] = vp
+            continue
+        if f == "budget":
+            from app.utils.money_parser import parse_money_to_int
+
+            bp = parse_money_to_int(vp)
+            ba = parse_money_to_int(va)
+            if bp is not None and ba is not None and bp > 0 and ba > 0:
+                ratio = min(bp, ba) / max(bp, ba)
+                if ratio >= 0.8:
+                    ent_m[f] = bp
+                    continue
+        disagreements.append(f)
+        ent_m[f] = "" if f == "budget" else ""
+
+    if disagreements:
+        logger.info("Self-consistency disagreed on %s; blanked.", ", ".join(disagreements))
+
+    merged["entities"] = ent_m
+    return merged
+
+
 def run_facts_extraction(transcript: str) -> dict[str, Any]:
     """
-    Single Groq call for factual JSON. Requires Groq client configured.
+    One or two Groq calls for factual JSON (depending on settings.extraction_self_consistency).
     """
-    parsed, ok = _run_single_facts_attempt(build_facts_extraction_prompt(transcript))
-    if ok and parsed:
+    prompt = build_facts_extraction_prompt(transcript)
+    parsed, ok = _run_single_facts_attempt(prompt, temperature=0.0)
+    if not ok or not parsed:
+        return default_facts_payload()
+
+    if not getattr(settings, "extraction_self_consistency", False):
         return parsed
-    return default_facts_payload()
+
+    alt, ok_alt = _run_single_facts_attempt(prompt, temperature=0.2)
+    if not ok_alt or not alt:
+        return parsed
+
+    try:
+        return _reconcile_facts_consistency(parsed, alt)
+    except Exception:
+        logger.exception("Self-consistency reconciliation failed; using primary pass")
+        return parsed
 
 
 def heuristics_facts_from_transcript(transcript: str) -> dict[str, Any]:

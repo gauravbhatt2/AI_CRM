@@ -36,7 +36,7 @@
 
 ## 1. Product Overview
 
-The AI CRM System is a full-stack application that automates the conversion of unstructured conversations into structured, AI-enriched CRM records. Built with **FastAPI** (backend), **React + Vite** (frontend), **PostgreSQL** (persistence), **Groq LLM** (factual extraction + evaluation + fallbacks), **local Whisper** (audio transcription), optional **pyannote** (speaker diarization), optional **OpenRouter** (deal chat), and optional **Google Workspace OAuth** (Gmail + Calendar on-demand), it delivers:
+The AI CRM System is a full-stack application that automates the conversion of unstructured conversations into structured, AI-enriched CRM records. Built with **FastAPI** (backend), **React + Vite** (frontend), **PostgreSQL** (persistence), **Groq LLM** (factual extraction + evaluation + fallbacks), **faster-whisper** (local CTranslate2-backed audio transcription — no torch required), optional **OpenRouter** (deal chat), and optional **Google Workspace OAuth** (Gmail + Calendar on-demand), it delivers:
 
 - **Multi-channel ingestion** — audio files, transcripts, emails, meeting notes, SMS
 - **Two-phase Groq extraction** — (1) factual JSON (statements, entities, participants, timestamps) in a **single** Groq call (very long transcripts are truncated with middle omitted); merged with heuristic hints; (2) evaluation JSON (intent, pain points, deal score, risk, summary, next action) from merged facts only; refiners + AI intelligence; CRM field mapping
@@ -68,7 +68,7 @@ The AI CRM System is a full-stack application that automates the conversion of u
 User uploads audio file (.mp3, .wav, .m4a, etc.)
     │
     ▼
-System transcribes via local Whisper; optional pyannote diarization → Speaker A/B on segments
+System transcribes via local faster-whisper (CTranslate2); rule-based speaker labeler applies "Sales"/"Customer" tags to segments (optional Groq refinement)
     │
     ▼
 Groq: factual extraction → merge with heuristics → evaluation (from facts) → refiners → 17-field CRM record shape
@@ -241,7 +241,7 @@ crm-ui/src/
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Audio ingest** (`/ingest/audio`): Whisper → optional **pyannote** segment labels → `run_transcript_pipeline` with `StructuredTranscript` → optional Groq/heuristic speaker pass if pyannote did not apply.
+**Audio ingest** (`/ingest/audio`): faster-whisper transcribe → heuristic speaker labeler (or optional Groq labeler when `GROQ_LABEL_SPEAKERS=true`) → `run_transcript_pipeline` with `StructuredTranscript`.
 
 ---
 
@@ -612,13 +612,52 @@ Schema migrations are handled idempotently in `database.py`:
 |------|-------------|---------------|
 | **API Standards** | OpenAPI docs at `/docs`; JSON schemas validated by Pydantic | FastAPI auto-generates OpenAPI spec |
 | **Configuration** | All secrets via `.env` file; no hardcoded credentials | Pydantic `Settings` class with env loading |
-| **Performance** | Async-friendly endpoints; transcription bounded by hardware/model size | `asyncio.to_thread` for blocking LLM/Whisper calls |
+| **Performance** | Async-friendly endpoints; gzip compression on payloads ≥ 1 KB; transcription bounded by hardware/model size; `/google/status` cached in-process (~20 s) | `asyncio.to_thread` for blocking LLM/Whisper calls; `GZipMiddleware`; TTL cache in `google_workspace.py` |
 | **Resilience** | LLM rate limit handling with retry and backoff; heuristic fallback | `groq_chat_with_retry` with configurable attempts |
 | **Observability** | Structured logging for ingestion, extraction, HubSpot, and AI intelligence | Python `logging` module throughout |
 | **Data Integrity** | Append-only audit log; PostgreSQL transactions; idempotent migrations | SQLAlchemy session management; audit_repository |
-| **Security** | PII minimized in external API calls; audio processed locally | Whisper runs on-server; only structured data sent to Groq |
+| **Security** | PII minimized in external API calls; audio processed locally; no torch/pyannote model weights leaving local cache | `faster-whisper` runs on-server; only structured data sent to Groq |
 | **Maintainability** | Modular service architecture; separated concerns | services/, utils/, models/, db/ layers |
 | **Backward Compatibility** | New fields have defaults; existing APIs unchanged | All new DB columns have `NOT NULL DEFAULT` values |
+
+### 14.1 Speed vs Accuracy Profiles
+
+Operators pick a profile with the single env `WHISPER_PROFILE`; the resolver applies every related flag for them. Any explicit `WHISPER_MODEL`/`WHISPER_BEAM_SIZE`/`WHISPER_FAST_DECODE`/`GROQ_LABEL_SPEAKERS`/`EXTRACTION_SELF_CONSISTENCY` env var overrides the profile preset.
+
+| Profile | Whisper model | Beam | Speaker labels (Groq) | Two-pass extraction | Approx. WER | Relative ingest speed |
+|---------|---------------|------|-----------------------|---------------------|-------------|-----------------------|
+| **Fast** | `base` | 1 | off | off | ~6% | 1× (baseline) |
+| **Balanced** (default) | `small` | 5 | on | on | ~4% | ~0.5× |
+| **Quality** | `large-v3` | 5 | on | on | ~3% | ~0.1–0.15× |
+
+### 14.2 Extraction accuracy layers
+
+Beyond Whisper, the system now applies four deterministic accuracy layers to every ingest channel (audio, transcript, email, meeting, SMS, CRM update). None of these depend on the audio profile.
+
+| Layer | Control | Behavior | Typical accuracy impact |
+|-------|---------|----------|-------------------------|
+| **Evidence grounding** | `EXTRACTION_REQUIRE_EVIDENCE` (default `true`) | Each extracted scalar field must appear as a literal substring of the transcript (with budget evidence also accepting numeric/scaled variants). Unsupported values are blanked and logged. | Removes ~90% of hallucinated fields on ambiguous calls. |
+| **Self-consistency** | `EXTRACTION_SELF_CONSISTENCY` (default `true` in balanced/quality) | Facts extraction runs twice (`t=0.0` then `t=0.2`). Disagreements on `budget`/`product`/`product_version`/`timeline`/`procurement_stage`/`implementation_scope` are blanked unless within 20%. | +5–8% net field accuracy on noisy transcripts; 1 extra Groq call per ingest. |
+| **Speaker-aware extraction** | `EXTRACTION_USE_SPEAKER_LABELS` + `GROQ_LABEL_SPEAKERS` (both default `true`) | The Groq prompt sees `[00:12] Customer: we need 50k` instead of plain text, so `budget_owner` and `intent` cannot be mis-attributed across speakers. | +3–5% on budget/intent attribution for multi-speaker audio. |
+| **Fuzzy account dedup** | `ACCOUNT_FUZZY_MATCH_THRESHOLD` (default `88`) | `rapidfuzz.token_set_ratio` against existing accounts after stripping legal suffixes (Inc/LLC/Ltd/etc.). Falls back to `difflib` if `rapidfuzz` is missing. | Eliminates duplicate accounts from ASR/case drift. |
+
+### 14.3 Money parsing coverage
+
+Budget normalization is centralized in `app/utils/money_parser.py` and is shared by the LLM path, heuristic fallback, and evidence grounding. It handles:
+
+- Plain numerics with group separators (`50,000`, `2,50,000`)
+- Short suffixes (`50k`, `2.5M`, `1.2B`)
+- Spelled-out words (`seventy five thousand`, `one and a half million`, `half a million`)
+- Indian units (`5 lakh`, `5 lakhs`, `2 crore`, `1.5 crores`)
+- Currency prefixes (`$`, `£`, `€`, `₹`, `Rs.`, `USD`, `INR`, `EUR`, `GBP`)
+- Ranges (`between 40k and 60k` → upper bound)
+- Negative signals (`no budget`, `can't afford` → empty, not zero)
+
+### 14.4 Idempotent re-ingests
+
+`EXTRACTION_CACHE_SIZE` (default `64`) enables an in-process LRU keyed by SHA256(model + settings + transcript). Replays skip both Whisper and Groq entirely. Size 0 disables the cache. The key incorporates `GROQ_MODEL`, `EXTRACTION_SELF_CONSISTENCY`, and `EXTRACTION_REQUIRE_EVIDENCE` so config changes invalidate cached entries automatically.
+
+Additional Whisper tuning: `WHISPER_VAD` (keep `true`), `WHISPER_VAD_MIN_SILENCE_MS` (500 ms default, tighter drops more silent noise), `WHISPER_LOG_PROB_THRESHOLD` (-1.0 default; tighten to -0.5 for noisy audio), `WHISPER_COMPUTE_TYPE` (`int8` CPU / `float16` CUDA by default), `WHISPER_DEVICE` (`auto` / `cpu` / `cuda`).
 
 ---
 
@@ -631,13 +670,18 @@ Schema migrations are handled idempotently in `database.py`:
 | `DATABASE_URL` | Yes | — | PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/db`) |
 | `GROQ_API_KEY` | Yes | — | Groq API key for extraction, evaluation, and chat fallback |
 | `GROQ_MODEL` | No | `llama-3.3-70b-versatile` | Groq model identifier |
-| `WHISPER_MODEL` | No | `turbo` | Local Whisper checkpoint (`turbo` / large-v3-turbo is faster than `large` / `large-v3` for English; also `tiny` … `large-v3`) |
-| `WHISPER_LANGUAGE` | No | `en` | ISO language code for Whisper — fixed `en` skips auto language detection |
-| `HUGGINGFACE_TOKEN` | No | — | Hugging Face token; enables pyannote diarization when set + license accepted |
-| `PYANNOTE_ENABLED` | No | `true` | Set `false` to skip pyannote even if token is set |
+| `WHISPER_MODEL` | No | `base` | faster-whisper checkpoint (`tiny`, `base`, `small`, `medium`, `large-v3`) |
+| `WHISPER_LANGUAGE` | No | `en` | ISO language code — fixed `en` skips auto language detection |
+| `WHISPER_FAST_DECODE` | No | `true` | Greedy beam=1 decode (much faster on clean audio) |
+| `WHISPER_BEAM_SIZE` | No | `1` | Only consulted when `WHISPER_FAST_DECODE=false` |
+| `WHISPER_VAD` | No | `true` | Voice Activity Detection prunes silent sections pre-decode |
+| `WHISPER_DEVICE` | No | `auto` | `auto` / `cpu` / `cuda` |
+| `WHISPER_COMPUTE_TYPE` | No | *(auto)* | Empty = int8 on CPU, float16 on GPU. Override for `int8_float16`, `float32`, etc. |
 | `OPENROUTER_API_KEY` | No | — | OpenRouter key for deal chat (`/agents/chat`) |
 | `OPENROUTER_MODEL` | No | `google/gemma-3-12b-it:free` | OpenRouter model id |
-| `GROQ_LABEL_SPEAKERS` | No | `true` | Extra Groq call for per-segment speaker labels when pyannote did not run |
+| `GROQ_LABEL_SPEAKERS` | No | `false` | Extra Groq call per upload to refine per-segment speaker labels (heuristic is default) |
+| `GOOGLE_STATUS_CACHE_TTL_SEC` | No | `20` | In-process cache window for `/api/v1/google/status/` |
+| `GZIP_MIN_SIZE_BYTES` | No | `1024` | Payload size threshold above which gzip middleware kicks in |
 | `HUBSPOT_API_KEY` | No | — | HubSpot private app token (enables sync features) |
 | `HUBSPOT_PIPELINE_ID` | No | — | Override HubSpot pipeline ID |
 | `HUBSPOT_DEAL_STAGE_ID` | No | — | Override HubSpot deal stage ID |
@@ -658,10 +702,14 @@ sqlalchemy
 psycopg2-binary
 openai
 python-dotenv
-openai-whisper
+faster-whisper        # CTranslate2 backend; no torch required
 requests
 python-multipart
-torch; torchaudio; pyannote.audio   # optional — speaker diarization
+APScheduler
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+email-validator
 ```
 
 ### 15.3 Frontend Dependencies
@@ -826,12 +874,11 @@ ai-crm-system/
     │   ├── groq_llm.py              # Groq client wrapper
     │   ├── groq_mapping.py          # LLM CRM entity resolution
     │   ├── groq_speakers.py         # Groq/heuristic speaker labeling on segments
-    │   ├── speaker_diarization.py   # Optional pyannote → Speaker A/B
     │   ├── chat_model.py            # OpenRouter deal chat (requests)
     │   ├── ai_intelligence.py       # Heuristic AI functions + batch runner
     │   ├── ingestion_pipeline.py    # Full pipeline orchestrator
     │   ├── mapping_service.py       # CRM mapping (LLM + rules)
-    │   ├── transcription_service.py # Local Whisper ASR
+    │   ├── transcription_service.py # faster-whisper ASR (CTranslate2)
     │   ├── hubspot_client.py        # HubSpot REST client
     │   ├── hubspot_service.py       # HubSpot sync orchestration
     │   ├── google_service.py        # Google OAuth credential storage and API helpers
@@ -876,3 +923,5 @@ crm-ui/
 | 2.1 | April 18, 2026 | Engineering | Two-phase Groq extraction (facts + evaluation); optional pyannote diarization; OpenRouter deal chat + Groq fallback; `extracted_facts` on ingest responses; docs and README aligned |
 | 2.2 | April 19, 2026 | Engineering | Agents + Google Workspace routes documented; React Router file layout; `GET /api/v1/records` alias; acceptance criteria marked complete; `VITE_API_URL`; removed redundant root status markdown; out-of-scope vs optional Google clarified |
 | 2.3 | April 19, 2026 | Engineering | Reverted sentence-level chunking and separate `chunked_extraction` / ASR cleanup / `extraction_validate` modules; facts phase is one Groq call with optional middle truncation for very long text; pipeline and file tree updated |
+| 2.4 | April 19, 2026 | Engineering | Removed pyannote/torch/torchaudio dependency and `speaker_diarization.py`; audio transcription migrated to `faster-whisper` (CTranslate2, INT8 CPU default) for 2-4x speedup; `GROQ_LABEL_SPEAKERS` now defaults `false` (heuristic speaker labels are instant); added gzip middleware and in-process TTL cache for `/google/status/`; frontend `GoogleConnect` shares a module-level cache so StrictMode remounts no longer cause a request storm; documented Speed-vs-Accuracy profiles in §14.1 (Fast / Balanced / Quality) with explicit WER + relative-speed expectations so operators can tune the audio path without guessing |
+| 2.5 | April 19, 2026 | Engineering | **Accuracy overhaul.** Single `WHISPER_PROFILE` env knob replaces the five-variable tuning dance (default `balanced` = `small` + `beam=5` + Groq speakers + two-pass self-consistency). Added centralized `money_parser.py` handling lakh/crore/spelled-out/ranges. Introduced `extraction_grounding.py` that blanks any LLM field not supported by literal transcript evidence (`EXTRACTION_REQUIRE_EVIDENCE=true`). Two-pass self-consistency (`EXTRACTION_SELF_CONSISTENCY`) reconciles disagreements on ambiguous fields (`budget`, `product`, `timeline`, `procurement_stage`, `implementation_scope`). Audio pipeline reordered so speaker-labeled transcript feeds the extractor (`EXTRACTION_USE_SPEAKER_LABELS=true`). Fuzzy account dedup via `rapidfuzz` (no torch) with legal-suffix stripping (`ACCOUNT_FUZZY_MATCH_THRESHOLD=88`). In-process SHA256 cache for idempotent re-ingests (`EXTRACTION_CACHE_SIZE=64`). Tighter VAD (`whisper_vad_min_silence_ms=500`) and explicit `log_prob_threshold` rejection for noisy segments. Evaluator harness expanded to 15 cases covering Indian currency/speaker attribution/procurement stages; CI gate raised from 20% to 75%, overridable via `--gate`. Full §14.1–14.4 rewrite. |

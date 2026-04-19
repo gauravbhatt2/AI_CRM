@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Project root = directory that contains the `app` package (not process cwd).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _ENV_PATH = _PROJECT_ROOT / ".env"
 load_dotenv(_ENV_PATH)
@@ -24,10 +23,8 @@ class Settings(BaseSettings):
     debug: bool = False
     api_v1_prefix: str = "/api/v1"
 
-    # PostgreSQL (SQLAlchemy); set DATABASE_URL in .env
     database_url: str | None = None
 
-    # Browsers reject "*" when credentials=True; list Vite/React dev servers explicitly.
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
@@ -38,41 +35,92 @@ class Settings(BaseSettings):
     ]
 
     # --- Groq (OpenAI-compatible API at https://api.groq.com/openai/v1) ---
-    # Set GROQ_API_KEY and GROQ_MODEL in .env — see https://console.groq.com/docs/models
     groq_api_key: str | None = None
     groq_model: str = Field(
         default="llama-3.3-70b-versatile",
-        description="Groq model id, e.g. llama-3.3-70b-versatile, mixtral-8x7b-32768",
+        description="Groq model id, e.g. llama-3.3-70b-versatile",
     )
 
-    # Extra Groq call per audio file to label each Whisper segment (Sales / Customer / names).
-    # Set GROQ_LABEL_SPEAKERS=false to disable and save quota.
+    # Per-audio-file Groq call to label Whisper segments with Sales/Customer/names.
+    # Default ON for accuracy: feeds speaker context into downstream Groq extraction
+    # so "our budget is 50k" is correctly attributed to Sales vs Customer.
+    # Costs ~2-4s per upload. Flip to false only when latency matters more than
+    # attribution correctness (see WHISPER_PROFILE=fast).
     groq_label_speakers: bool = True
 
-    # OpenAI Whisper (local). Use `turbo` (large-v3-turbo) for English: faster than `large` / `large-v3`.
-    # Lighter dev option: tiny, base, small, medium.
-    whisper_model: str = "turbo"
-    # Passed to whisper.transcribe — skips auto language detection when set (English-only deployments).
+    # --- faster-whisper (local ASR) ---
+    # Speed/accuracy profile. Applied lazily via `resolve_whisper_profile()` so
+    # explicit WHISPER_MODEL/BEAM/FAST_DECODE env overrides always win.
+    #   fast     : base  + beam=1      (~6% WER, fastest, dashboards/demos)
+    #   balanced : small + beam=5      (~4% WER, production default)
+    #   quality  : large-v3 + beam=5   (~3% WER, legal/compliance workloads)
+    whisper_profile: str = Field(
+        default="balanced",
+        description="'fast' | 'balanced' | 'quality' — one-knob override for whisper_model/beam/fast_decode",
+    )
+
+    # Model size controls the speed/accuracy tradeoff.
+    #   tiny / base         : fastest; WER ~6% on clean English
+    #   small / medium      : balanced; WER ~4%
+    #   large-v3 / large-v3-turbo : slowest; WER ~3%
+    # Default `small` (balanced profile) — override via WHISPER_MODEL env.
+    whisper_model: str = "small"
+
+    # ISO language hint; skips auto-detection (saves 1-3s per call).
     whisper_language: str = Field(default="en", description="Whisper language code, e.g. en")
-    # Faster decode (beam_size=1); slightly lower quality. When false, uses whisper_beam_size.
+
+    # Greedy decoding (beam=1) is 3-5x faster than beam=5 with ~1% more WER on
+    # clean audio and 3-5% more on noisy audio. Default off in balanced profile.
     whisper_fast_decode: bool = False
     whisper_beam_size: int = 5
 
-    # Transcript display: "roles" keeps Sales/Customer-style labels; "speaker_ab" maps to Speaker A / B.
+    # Voice Activity Detection prunes silent chunks before decoding (large speedup).
+    whisper_vad: bool = True
+    # Tighter silence threshold reduces false speech triggers on quiet noise.
+    whisper_vad_min_silence_ms: int = 500
+
+    # Drop Whisper segments whose average log-probability is below this threshold
+    # (fraction on [0.0, 1.0] range maps to negative log-prob in ctranslate2).
+    # Uses faster-whisper's `log_prob_threshold`. Empty string = library default (-1.0).
+    whisper_log_prob_threshold: str = Field(
+        default="-1.0",
+        description="Reject segments with avg_logprob below this value (default -1.0; stricter = -0.5)",
+    )
+
+    # Device selection for faster-whisper / CTranslate2.
+    #   auto -> CUDA when available, else CPU
+    whisper_device: str = Field(default="auto", description="'auto', 'cpu', or 'cuda'")
+    # Empty string lets the loader pick int8 (CPU) or float16 (CUDA).
+    whisper_compute_type: str = Field(default="", description="int8 | int8_float16 | float16 | float32")
+
+    # --- Extraction accuracy controls ---
+    # Two-pass self-consistency on ambiguous fields (budget/intent/timeline/product_version).
+    # Runs the facts extraction a second time at temperature=0.2 and reconciles
+    # disagreements (keep agreed value; blank contested). ~+1 Groq call per ingest.
+    extraction_self_consistency: bool = True
+
+    # Evidence-grounded extraction: each extracted value must be supported by a
+    # literal substring of the transcript. Values without evidence are blanked.
+    # Eliminates hallucinated fields on noisy/ambiguous calls.
+    extraction_require_evidence: bool = True
+
+    # Feed speaker-labeled transcript ('[00:05] Sales: ...') into the extractor
+    # instead of plain text. Requires groq_label_speakers=true for audio path.
+    extraction_use_speaker_labels: bool = True
+
+    # Fuzzy account matching: treat "Acme Corp", "Acme Inc.", "acme-corp" as the
+    # same account when token-set similarity >= this threshold (0-100). Prevents
+    # duplicate accounts from ASR casing/punctuation drift. Requires rapidfuzz.
+    account_fuzzy_match_threshold: int = 88
+
+    # SHA256-keyed in-process cache for identical re-ingests (Whisper + Groq).
+    # Size = number of transcripts retained; 0 disables.
+    extraction_cache_size: int = 64
+
+    # Transcript display: "roles" keeps Sales/Customer labels; "speaker_ab" maps to A/B.
     transcript_speaker_labels: str = "roles"
 
-    # --- pyannote speaker diarization (optional; requires huggingface token + model license) ---
-    huggingface_token: str | None = Field(
-        default=None,
-        description="Hugging Face token for pyannote models (accept license on model card first)",
-    )
-    pyannote_enabled: bool = Field(default=True, description="Run pyannote when token is set")
-    pyannote_model_id: str = Field(
-        default="pyannote/speaker-diarization-3.1",
-        description="Hugging Face model id for diarization pipeline",
-    )
-
-    # --- OpenRouter (deal chat, e.g. Gemma) — requests-based; no transcript in prompt ---
+    # --- OpenRouter (deal chat, e.g. Gemma) ---
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = Field(
@@ -87,12 +135,10 @@ class Settings(BaseSettings):
 
     # HubSpot private app token (used for deal sync).
     hubspot_api_key: str | None = None
-    # Pipeline id (usually "default"). Stage id is portal-specific (numeric in many accounts).
-    # Leave HUBSPOT_DEAL_STAGE_ID empty to auto-pick the first stage of that pipeline via the API.
     hubspot_pipeline_id: str = "default"
     hubspot_deal_stage_id: str = ""
 
-    # --- Gmail (optional; demo uses mock send) ---
+    # --- Gmail (optional) ---
     gmail_send_enabled: bool = Field(
         default=False,
         description="When true, attempt real Gmail send once API client is configured",
@@ -107,7 +153,7 @@ class Settings(BaseSettings):
         description="e.g. sales@company.com — used if participants/metadata have no email",
     )
 
-    # Google OAuth (Gmail send + Calendar) — mailNDcalendar integration
+    # Google OAuth (Gmail send + Calendar)
     google_client_id: str | None = None
     google_client_secret: str | None = None
     google_redirect_uri: str | None = None
@@ -116,10 +162,63 @@ class Settings(BaseSettings):
         description="Browser URL after OAuth callback (must match a registered redirect URI)",
     )
 
+    # Cache window (seconds) for the /google/status probe so the TopBar pill
+    # does not hit Google on every React re-render / dev-mode remount.
+    google_status_cache_ttl_sec: float = 20.0
+
+    # Response compression kicks in for payloads >= this threshold (bytes).
+    gzip_min_size_bytes: int = 1024
+
+
+_WHISPER_PROFILES: dict[str, dict[str, object]] = {
+    "fast": {
+        "whisper_model": "base",
+        "whisper_fast_decode": True,
+        "whisper_beam_size": 1,
+        "groq_label_speakers": False,
+        "extraction_self_consistency": False,
+    },
+    "balanced": {
+        "whisper_model": "small",
+        "whisper_fast_decode": False,
+        "whisper_beam_size": 5,
+        "groq_label_speakers": True,
+        "extraction_self_consistency": True,
+    },
+    "quality": {
+        "whisper_model": "large-v3",
+        "whisper_fast_decode": False,
+        "whisper_beam_size": 5,
+        "groq_label_speakers": True,
+        "extraction_self_consistency": True,
+    },
+}
+
+
+def _apply_whisper_profile(s: Settings) -> Settings:
+    """Apply WHISPER_PROFILE defaults, but only where the user did not set an explicit env var."""
+    import os
+
+    profile = (s.whisper_profile or "").strip().lower()
+    if profile not in _WHISPER_PROFILES:
+        return s
+    preset = _WHISPER_PROFILES[profile]
+    env_override = {
+        "whisper_model": "WHISPER_MODEL",
+        "whisper_fast_decode": "WHISPER_FAST_DECODE",
+        "whisper_beam_size": "WHISPER_BEAM_SIZE",
+        "groq_label_speakers": "GROQ_LABEL_SPEAKERS",
+        "extraction_self_consistency": "EXTRACTION_SELF_CONSISTENCY",
+    }
+    for attr, value in preset.items():
+        if os.environ.get(env_override[attr]) is None:
+            setattr(s, attr, value)
+    return s
+
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return _apply_whisper_profile(Settings())
 
 
 settings = get_settings()

@@ -15,7 +15,7 @@ Sales and support teams generate rich conversational data — calls, meetings, e
 
 This product solves that by turning **raw audio or text conversations** into **structured, AI-enriched CRM records** in seconds. It:
 
-1. **Transcribes** audio via local Whisper (no data leaves the server for ASR); optionally **diarizes** speakers (pyannote → Speaker A/B merged to Whisper segments) when a Hugging Face token is configured.
+1. **Transcribes** audio locally via `faster-whisper` (CTranslate2 backend — no torch, no large model downloads by default). No audio leaves the server. Rule-based speaker labeling tags each segment as "Sales" / "Customer" / named participants; a Groq-powered refinement pass is available behind an opt-in flag.
 2. **Extracts** structured CRM fields via a **two-phase** Groq pipeline — **factual extraction** (statements, entities, participants, timestamps) then **evaluation** (intent, pain points, scoring, next actions) from merged facts — with heuristic fallback where needed.
 3. **Classifies, scores, and analyzes** every interaction through an AI Intelligence Layer — producing deal scores, risk assessments, summaries, next actions, and tags automatically.
 4. **Persists** everything to a local PostgreSQL datastore with full audit trail.
@@ -82,7 +82,7 @@ The fundamental issue is that **structured CRM data requires human translation**
 
 | Area | Capabilities |
 |------|-------------|
-| **Audio Ingestion** | Upload audio/video files; local Whisper transcription; optional **pyannote** speaker diarization (HF token) merged to segments; optional Groq/heuristic speaker labels if diarization off; supported formats via FFmpeg |
+| **Audio Ingestion** | Upload audio/video files; local `faster-whisper` transcription (INT8 on CPU, float16 on CUDA); heuristic speaker labels by default with opt-in Groq refinement (`GROQ_LABEL_SPEAKERS=true`); supported formats via FFmpeg |
 | **Text Ingestion** | Direct transcript paste/POST; email, meeting notes, SMS content |
 | **Multi-channel Support** | Source types: `call`, `email`, `meeting`, `sms`, `crm_update` with metadata tracking |
 | **AI Extraction (17 fields)** | `budget` (integer), `intent` (high/medium/low), `timeline` (decision-only), `product`, `product_version`, `competitors`, `industry`, `pain_points`, `next_step`, `urgency_reason`, `stakeholders`, `mentioned_company`, `procurement_stage`, `use_case`, `decision_criteria`, `budget_owner`, `implementation_scope` |
@@ -129,10 +129,11 @@ The fundamental issue is that **structured CRM data requires human translation**
 │  │          │  │                │  │ JSON)     │  │  Deal)       │ │
 │  └──────────┘  └────────────────┘  └───────────┘  └──────┬───────┘ │
 │       │                                                   │         │
-│  ┌────┴─────┐  ┌──────────────┐                    ┌─────┴──────┐  │
-│  │ Whisper  │  │ pyannote (opt)│                    │ PostgreSQL │  │
-│  │ (local)  │  │ Speaker A/B    │                    │ (persist)  │  │
-│  └──────────┘  └──────────────┘                    └─────┬──────┘  │
+│  ┌────┴──────────────┐  ┌───────────────┐         ┌─────┴──────┐  │
+│  │ faster-whisper     │  │ Heuristic      │         │ PostgreSQL │  │
+│  │ (CTranslate2,      │  │ speaker labels │         │ (persist)  │  │
+│  │  INT8 CPU / FP16)  │  │ (+ opt. Groq)  │         └─────┬──────┘  │
+│  └───────────────────┘  └───────────────┘               │         │
 │                                                      │         │
 │  ┌───────────────────────────────────────────────────┴──────┐  │
 │  │                   HubSpot Sync Service                    │  │
@@ -143,7 +144,7 @@ The fundamental issue is that **structured CRM data requires human translation**
 
 ### Data Flow
 
-1. **Ingest** — Audio files are transcribed locally via Whisper; optional pyannote diarization aligns Speaker A/B to segments; text payloads pass through directly
+1. **Ingest** — Audio files are transcribed locally via `faster-whisper` (INT8 CPU default). Rule-based speaker labeling tags segments; Groq-based label refinement is an opt-in flag. Text/email payloads pass through directly.
 2. **Extract** — Groq extracts **facts** in one pass (very long transcripts are truncated with middle omitted for the facts call), merges with heuristic hints, then **evaluates** intelligence (intent, pain, score, etc.) from merged facts; heuristic fallback fills gaps if LLM is unavailable or rate-limited
 3. **Enrich** — AI Intelligence Layer merges LLM evaluation with heuristics: classify, score, detect risk, summarize, suggest next action, auto-tag
 4. **Map** — Extracted entities are resolved to existing Accounts, Contacts, and Deals (LLM + rule-based)
@@ -158,7 +159,9 @@ The fundamental issue is that **structured CRM data requires human translation**
 |-----|--------|----------------|
 | **Time to structured record** | < 30 seconds from ingestion to persisted record | Timestamp delta: API request → DB commit |
 | **Field completeness** | ≥ 80% of records have budget, intent, product, and timeline populated (where mentioned in conversation) | Query `crm_records` for non-empty core fields |
-| **Extraction accuracy** | Fields match human judgment in ≥ 85% of cases | Spot-check sampling against human labels |
+| **Extraction accuracy** | Fields match human judgment in ≥ 85% of cases on the **Balanced** profile; regression guard at ≥ 75% enforced by `python -m app.evaluation.evaluator` in CI | Built-in evaluator harness (15 gold cases covering USD/EUR/INR budgets, lakh/crore, multi-speaker attribution, procurement stages) + spot-check sampling against human labels |
+| **Hallucination rate (extracted fields)** | ≤ 5% of extracted scalar fields are unsupported by the transcript, measured on the Balanced profile with `EXTRACTION_REQUIRE_EVIDENCE=true` | `extraction_grounding.ground_extracted_entities` rejection log per ingest |
+| **Transcription accuracy (English, clean audio)** | ≥ 96% word accuracy on the **Balanced** (default) profile; ≥ 97% on **Quality**; ≥ 93% on **Fast** (see PRD §14.1) | Sample-diffed transcripts against reference text |
 | **AI Intelligence coverage** | 100% of records receive classification, score, risk, summary, next action, and tags | Query for non-empty AI fields |
 | **HubSpot sync success rate** | ≥ 95% of sync attempts complete without API errors | API response logs / UI feedback |
 | **Deal score reliability** | Scored deals correlate with actual outcomes (directional) | Retrospective analysis |
@@ -326,5 +329,7 @@ Legacy “Interaction Mining” BRD/FRD/DRD themes (transcription, extraction, u
 | 1.0 | April 2026 | Engineering | Initial BRD — core ingestion, extraction, HubSpot sync |
 | 2.0 | April 15, 2026 | Engineering | Expanded to cover AI Intelligence Layer (6 functions), 17-field extraction schema, advanced CRM fields, deal scoring logic, modern SaaS UI, comprehensive analytics, multi-channel ingestion, full architecture documentation |
 | 2.1 | April 18, 2026 | Engineering | Two-phase extraction, pyannote/OpenRouter, PRD alignment |
+| 2.2 | April 19, 2026 | Engineering | Removed pyannote/torch stack; ASR migrated to faster-whisper (CTranslate2); gzip responses; cached Google status endpoint; added transcription-accuracy KPI tied to Fast / Balanced / Quality profiles (PRD §14.1) so the speed-first default is still measurable against a recoverable quality ceiling |
 | 2.2 | April 19, 2026 | Engineering | Agents API and optional Google Workspace OAuth reflected in scope; removed duplicate status doc; UI described as multi-page React app |
 | 2.3 | April 19, 2026 | Engineering | Facts extraction simplified to a single Groq pass (no sentence chunking); removed separate ASR cleanup / post-extraction validation modules; architecture diagram updated |
+| 2.4 | April 19, 2026 | Engineering | **Accuracy-first defaults.** Shipped `WHISPER_PROFILE=balanced` (small + beam=5 + Groq speakers + two-pass self-consistency) as the new default. Introduced three new KPIs: raised extraction-accuracy target to 85% on Balanced with a 75% CI regression gate, added a hallucination-rate KPI (≤ 5% unsupported fields via evidence grounding), and lifted transcription-accuracy expectations (≥ 96% Balanced, ≥ 97% Quality). Added fuzzy account dedup (`ACCOUNT_FUZZY_MATCH_THRESHOLD=88`) so inbound calls cannot create "Acme Corp" / "Acme Inc." duplicates. Added idempotent transcript cache (`EXTRACTION_CACHE_SIZE=64`) for replay-safe re-ingests. Money parser now supports Indian units (lakh/crore) and fractional spelled-out amounts for accurate APAC deal sizing. |

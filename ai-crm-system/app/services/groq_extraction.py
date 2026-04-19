@@ -6,12 +6,17 @@ Prompts live in `extraction_service`. Chunking/merge in `facts_extraction`.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import re
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from app.core.config import settings
+from app.services.extraction_grounding import ground_extracted_entities
 from app.services.groq_llm import get_groq_client
 from app.utils.extraction_refine import (
     refine_budget_core_field,
@@ -23,6 +28,56 @@ from app.utils.extraction_refine import (
 )
 from app.utils.heuristic_extraction import heuristic_extract_entities, merge_extraction_prefer_llm
 logger = logging.getLogger(__name__)
+
+
+_extraction_cache: "OrderedDict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]" = OrderedDict()
+_extraction_cache_lock = threading.Lock()
+
+
+def _cache_key(transcript: str) -> str:
+    h = hashlib.sha256()
+    h.update((settings.groq_model or "").encode("utf-8", errors="ignore"))
+    h.update(b"\x00")
+    h.update(
+        str(bool(getattr(settings, "extraction_self_consistency", False))).encode("ascii")
+    )
+    h.update(b"\x00")
+    h.update(
+        str(bool(getattr(settings, "extraction_require_evidence", True))).encode("ascii")
+    )
+    h.update(b"\x00")
+    h.update((transcript or "").encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def _cache_get(key: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+    with _extraction_cache_lock:
+        if key not in _extraction_cache:
+            return None
+        _extraction_cache.move_to_end(key)
+        ex, ai, facts = _extraction_cache[key]
+        return copy.deepcopy(ex), copy.deepcopy(ai), copy.deepcopy(facts)
+
+
+def _cache_put(
+    key: str,
+    value: tuple[dict[str, Any], dict[str, Any], dict[str, Any]],
+) -> None:
+    size = int(getattr(settings, "extraction_cache_size", 0) or 0)
+    if size <= 0:
+        return
+    ex, ai, facts = value
+    with _extraction_cache_lock:
+        _extraction_cache[key] = (copy.deepcopy(ex), copy.deepcopy(ai), copy.deepcopy(facts))
+        _extraction_cache.move_to_end(key)
+        while len(_extraction_cache) > size:
+            _extraction_cache.popitem(last=False)
+
+
+def clear_extraction_cache() -> None:
+    """Test/ops utility."""
+    with _extraction_cache_lock:
+        _extraction_cache.clear()
 
 DEFAULT_EXTRACTION: dict[str, Any] = {
     "budget": "",
@@ -178,30 +233,23 @@ def _coerce_string_list(value: Any) -> list[str]:
 
 
 def _coerce_budget(value: Any) -> str:
-    """Normalize budget to a clean integer string, or empty."""
+    """Normalize budget to a clean integer string, or empty.
+
+    Handles plain numerics, k/m/b suffixes, spelled-out numbers
+    ("seventy five thousand"), and Indian units ("5 lakh", "2 crore").
+    """
     if value is None or _is_na_token(value):
         return ""
+    from app.utils.money_parser import parse_money_to_str
+
+    result = parse_money_to_str(value)
+    if result:
+        return result
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(int(value))
-    raw = str(value).strip()
-    if not raw:
-        return ""
-    cleaned = re.sub(r"[,$£€\s]", "", raw)
-    m = re.match(r"^(\d+(?:\.\d+)?)\s*([kKmM])?$", cleaned)
-    if m:
-        num = float(m.group(1))
-        suffix = (m.group(2) or "").lower()
-        if suffix == "k":
-            num *= 1_000
-        elif suffix == "m":
-            num *= 1_000_000
-        return str(int(num))
-    digits = re.sub(r"[^\d.]", "", raw)
-    if digits:
         try:
-            return str(int(float(digits)))
+            return str(int(value))
         except (ValueError, OverflowError):
-            pass
+            return ""
     return ""
 
 
@@ -349,7 +397,7 @@ def _finalize_two_phase(
     merged_facts: dict[str, Any],
     eval_block: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Heuristic merge, refiners, run_ai_intelligence."""
+    """Heuristic merge, refiners, evidence grounding, run_ai_intelligence."""
     from app.services.ai_intelligence import run_ai_intelligence
 
     llm_ex, llm_ai = facts_eval_to_extracted_and_ai(merged_facts, eval_block)
@@ -363,6 +411,10 @@ def _finalize_two_phase(
     refine_product_core_field(merged, src)
     refine_timeline_core_field(merged, src)
     enrich_map_version_custom_field(merged, src)
+
+    grounding_enabled = bool(getattr(settings, "extraction_require_evidence", True))
+    merged, _rejected = ground_extracted_entities(merged, src, enabled=grounding_enabled)
+
     ai = run_ai_intelligence(src, merged, llm_primary=llm_ai)
     return merged, ai, merged_facts
 
@@ -380,9 +432,10 @@ def _heuristic_fallback_pipeline(src: str) -> tuple[dict[str, Any], dict[str, An
 
 def run_transcript_extraction_pipeline(transcript: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """
-    transcript → facts (single Groq call) → merge with heuristics → evaluation.
+    transcript → facts (one or two Groq calls) → merge w/ heuristics → evaluation → grounding.
 
-    Returns (extracted_entities, ai_intelligence, merged_extracted_facts).
+    Returns (extracted_entities, ai_intelligence, merged_extracted_facts). Identical
+    transcripts are served from an in-process SHA256 cache (size = EXTRACTION_CACHE_SIZE).
     """
     from app.services.ai_intelligence import run_ai_intelligence
     from app.services.evaluation_groq import deterministic_evaluation, run_evaluation_groq
@@ -397,11 +450,19 @@ def run_transcript_extraction_pipeline(transcript: str) -> tuple[dict[str, Any],
         ai = run_ai_intelligence("", empty_ex, llm_primary=None)
         return empty_ex, ai, default_facts_payload()
 
+    key = _cache_key(src)
+    cached = _cache_get(key)
+    if cached is not None:
+        logger.info("Extraction cache hit (key=%s...)", key[:10])
+        return cached
+
     try:
         get_groq_client()
     except RuntimeError as exc:
         logger.error("%s", exc)
-        return _heuristic_fallback_pipeline(src)
+        result = _heuristic_fallback_pipeline(src)
+        _cache_put(key, result)
+        return result
 
     merged_facts = run_facts_extraction(src)
     merged_facts = _augment_merged_facts(merged_facts, src)
@@ -410,7 +471,9 @@ def run_transcript_extraction_pipeline(transcript: str) -> tuple[dict[str, Any],
     if ev is None:
         ev = deterministic_evaluation(merged_facts)
 
-    return _finalize_two_phase(src, merged_facts, ev)
+    result = _finalize_two_phase(src, merged_facts, ev)
+    _cache_put(key, result)
+    return result
 
 
 def run_unified_extraction(transcript: str) -> tuple[dict[str, Any], dict[str, Any]]:
