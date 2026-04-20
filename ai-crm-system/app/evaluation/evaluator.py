@@ -68,11 +68,125 @@ EVAL_CASES: list[dict[str, Any]] = [
         "id": "competitor_timeline",
         "transcript": (
             "We're evaluating you versus Salesforce for rollout in Q3. Budget is around 120k. "
-            "Ship the hardware tomorrow is not the decision timeline — Q3 is when we decide."
+            "Ship the hardware tomorrow is not the decision timeline \u2014 Q3 is when we decide."
         ),
         "expected": {
             "competitors": ["Salesforce"],
             "intent": "medium",
+            "budget": "120000",
+        },
+    },
+    {
+        "id": "budget_indian_lakh",
+        "transcript": (
+            "Hi, Priya here from Flipwave Retail. We have an approved budget of 5 lakh rupees "
+            "for the quarter and plan to roll out nationally once finance signs the PO."
+        ),
+        "expected": {
+            "budget": "500000",
+            "mentioned_company": "Flipwave Retail",
+            "intent": "high",
+        },
+    },
+    {
+        "id": "budget_crore",
+        "transcript": (
+            "Our parent group has earmarked 2 crore for this initiative, and we want to close "
+            "before the end of Q1. We've compared you with Salesforce and Zoho."
+        ),
+        "expected": {
+            "budget": "20000000",
+            "competitors": ["Salesforce", "Zoho"],
+        },
+    },
+    {
+        "id": "budget_million_words",
+        "transcript": (
+            "We want to commit one and a half million dollars in the first year. "
+            "Legal is reviewing the MSA right now; timeline is Q2 go-live."
+        ),
+        "expected": {
+            "budget": "1500000",
+            "intent": "high",
+        },
+    },
+    {
+        "id": "budget_range",
+        "transcript": (
+            "Our budget is somewhere between 40k and 60k depending on the seat count. "
+            "We need the deal closed in the next two months."
+        ),
+        "expected": {
+            "budget": "60000",
+        },
+    },
+    {
+        "id": "no_budget_low_intent",
+        "transcript": (
+            "Honestly, we have no budget this year and we're just exploring options. "
+            "We'll circle back next fiscal maybe."
+        ),
+        "expected": {
+            "intent": "low",
+            "interaction_type": "inquiry",
+        },
+    },
+    {
+        "id": "procurement_stage_negotiation",
+        "transcript": (
+            "Proposal received, legal is redlining the MSA, and procurement has asked "
+            "for a 10% discount. We are in active contract negotiation."
+        ),
+        "expected": {
+            "procurement_stage": "negotiation",
+            "intent": "high",
+        },
+    },
+    {
+        "id": "pilot_scope",
+        "transcript": (
+            "Let's start with a 90-day pilot for the APAC region with five seats. "
+            "If that works we will roll out company-wide in Q4."
+        ),
+        "expected": {
+            "implementation_scope": "pilot",
+            "intent": "medium",
+        },
+    },
+    {
+        "id": "budget_owner",
+        "transcript": (
+            "CFO Ravi Menon owns the budget. He wants ROI within 12 months. "
+            "Reporting time is our biggest pain today."
+        ),
+        "expected": {
+            "budget_owner": "Ravi Menon",
+            "pain_points": "reporting",
+        },
+    },
+    {
+        "id": "speaker_attribution",
+        "transcript": (
+            "[00:00] Sales: Thank you for calling. How can I help?\n"
+            "[00:04] Customer: I'm Maya from Bluebird Labs. Our budget is 30k for a new CRM.\n"
+            "[00:12] Sales: We can do that. Timeline?\n"
+            "[00:15] Customer: We need to decide within two weeks."
+        ),
+        "expected": {
+            "budget": "30000",
+            "mentioned_company": "Bluebird Labs",
+            "intent": "high",
+        },
+    },
+    {
+        "id": "urgency_risk",
+        "transcript": (
+            "If we can't resolve this by Friday we'll have to pull the contract. "
+            "Our COO is copied on this escalation."
+        ),
+        "expected": {
+            "risk_level": "high",
+            "interaction_type": "complaint",
         },
     },
 ]
@@ -101,7 +215,7 @@ def _field_match(predicted: Any, expected: Any, *, field: str) -> bool:
         exp_l = [str(x).strip().lower() for x in expected if str(x).strip()]
         pred_l = [str(x).strip().lower() for x in pred if str(x).strip()]
         return all(any(e in p or p in e for p in pred_l) for e in exp_l) if exp_l else True
-    if field == "mentioned_company":
+    if field in ("mentioned_company", "budget_owner", "pain_points", "procurement_stage", "implementation_scope"):
         pe, ee = _norm_str(predicted), _norm_str(expected)
         if not ee:
             return True
@@ -160,12 +274,28 @@ def run_evaluation() -> dict[str, Any]:
     }
 
 
+CI_ACCURACY_THRESHOLD = 75.0
+
+
 def main() -> None:
     report = run_evaluation()
     print(json.dumps(report, indent=2))
-    # Non-zero exit if accuracy is very low (optional signal for CI)
-    if report["accuracy_score"] < 20.0 and len(EVAL_CASES) >= 3:
+    # CI gate matches the BRD §7 operational KPI: >=75% field-match accuracy.
+    # Tune via `python -m app.evaluation.evaluator --gate 85` if you want stricter.
+    gate = CI_ACCURACY_THRESHOLD
+    for i, arg in enumerate(sys.argv):
+        if arg == "--gate" and i + 1 < len(sys.argv):
+            try:
+                gate = float(sys.argv[i + 1])
+            except ValueError:
+                pass
+    if report["accuracy_score"] < gate and len(EVAL_CASES) >= 3:
+        print(
+            f"FAIL: accuracy_score {report['accuracy_score']:.2f} < gate {gate:.2f}",
+            file=sys.stderr,
+        )
         sys.exit(2)
+    print(f"PASS: accuracy_score {report['accuracy_score']:.2f} >= gate {gate:.2f}")
 
 
 if __name__ == "__main__":

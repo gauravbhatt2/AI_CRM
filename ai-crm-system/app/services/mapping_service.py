@@ -13,10 +13,73 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models import Account, Contact, Deal
 from app.services.groq_mapping import llm_suggest_crm_links
 
 logger = logging.getLogger(__name__)
+
+try:
+    from rapidfuzz import fuzz as _rf_fuzz  # type: ignore
+except ImportError:  # pragma: no cover
+    _rf_fuzz = None
+
+
+_GENERIC_ACCOUNT_SUFFIXES = (
+    "inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation",
+    "company", "co", "gmbh", "pvt", "private", "plc", "group", "groups",
+    "holdings", "enterprises", "technologies", "solutions", "services",
+    "systems", "global", "international", "intl", "labs", "the",
+)
+
+
+def _canon_account_name(name: str) -> str:
+    """Normalize a company name for fuzzy comparison (lowercase, strip punctuation + legal suffixes)."""
+    s = re.sub(r"[^a-z0-9\s]", " ", (name or "").lower())
+    parts = [p for p in s.split() if p and p not in _GENERIC_ACCOUNT_SUFFIXES]
+    return " ".join(parts).strip()
+
+
+def _best_fuzzy_account(db: Session, target: str, threshold: int) -> Account | None:
+    """Return the existing Account whose canonical form is most similar to `target`.
+
+    Uses rapidfuzz token_set_ratio when available; falls back to difflib otherwise.
+    """
+    canon_t = _canon_account_name(target)
+    if len(canon_t) < 2:
+        return None
+
+    candidates = db.scalars(
+        select(Account).order_by(Account.id.desc()).limit(256)
+    ).all()
+    if not candidates:
+        return None
+
+    best: Account | None = None
+    best_score = 0
+    if _rf_fuzz is not None:
+        for acc in candidates:
+            canon_c = _canon_account_name(acc.name or "")
+            if not canon_c:
+                continue
+            score = int(_rf_fuzz.token_set_ratio(canon_t, canon_c))
+            if score > best_score:
+                best = acc
+                best_score = score
+    else:
+        from difflib import SequenceMatcher
+
+        for acc in candidates:
+            canon_c = _canon_account_name(acc.name or "")
+            if not canon_c:
+                continue
+            ratio = SequenceMatcher(None, canon_t, canon_c).ratio()
+            score = int(round(ratio * 100))
+            if score > best_score:
+                best = acc
+                best_score = score
+
+    return best if best_score >= threshold else None
 
 # Words to ignore when treating capitalized tokens as person/company names
 _SKIP_CAPITALIZED: frozenset[str] = frozenset(
@@ -104,11 +167,21 @@ def _get_or_create_account(db: Session, name: str) -> Account:
     key = name.strip()
     if not key:
         key = DEFAULT_ACCOUNT_NAME
+
     existing = db.scalars(
         select(Account).where(func.lower(Account.name) == func.lower(key))
     ).first()
     if existing:
         return existing
+
+    if key != DEFAULT_ACCOUNT_NAME:
+        threshold = int(getattr(settings, "account_fuzzy_match_threshold", 88) or 88)
+        if threshold > 0:
+            fuzzy = _best_fuzzy_account(db, key, threshold)
+            if fuzzy is not None:
+                logger.info("Fuzzy-matched account '%s' -> existing id=%s ('%s')", key, fuzzy.id, fuzzy.name)
+                return fuzzy
+
     row = Account(name=key)
     db.add(row)
     db.flush()

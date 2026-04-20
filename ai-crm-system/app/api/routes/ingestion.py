@@ -26,7 +26,6 @@ from app.services.groq_speakers import (
     maybe_relabel_speakers_ab,
 )
 from app.services.ingestion_pipeline import build_audio_ingest_response, run_transcript_pipeline
-from app.services.speaker_diarization import apply_pyannote_to_segments
 from app.services.transcription_service import (
     FfmpegRequiredError,
     WhisperNotInstalledError,
@@ -98,9 +97,7 @@ async def ingest_transcript(
     body: TranscriptIngestRequest,
     db: Session = Depends(get_db),
 ) -> TranscriptIngestResponse:
-    """
-    Accept a transcript, run Groq extraction, and return structured CRM fields.
-    """
+    """Accept a transcript, run Groq extraction, and return structured CRM fields."""
     _require_groq()
     meta = dict(body.metadata or {})
     meta.setdefault("source_type", body.source_type)
@@ -120,9 +117,7 @@ async def ingest_interaction(
     body: InteractionIngestRequest,
     db: Session = Depends(get_db),
 ) -> TranscriptIngestResponse:
-    """
-    Ingest text from email, SMS, meetings, CRM webhooks, or calls — same pipeline as `/transcript`.
-    """
+    """Ingest text from email, SMS, meetings, CRM webhooks, or calls — same pipeline as `/transcript`."""
     _require_groq()
     meta = dict(body.metadata or {})
     meta.setdefault("source_type", body.source_type)
@@ -146,8 +141,15 @@ async def ingest_audio(
     db: Session = Depends(get_db),
 ) -> AudioIngestResponse:
     """
-    Upload audio or video, transcribe with Whisper (timestamped segments), optional speaker labels,
-    then run the same extraction + CRM pipeline as `/ingest/transcript`.
+    Upload audio/video, transcribe with faster-whisper, label speakers, then run the
+    speaker-aware extraction + CRM pipeline.
+
+    Flow (accuracy-first):
+    1. Transcribe with timestamps.
+    2. Label speakers (Groq if `GROQ_LABEL_SPEAKERS=true`, else heuristic).
+    3. Feed the speaker-labeled transcript into Groq extraction so Sales vs
+       Customer attribution is unambiguous (requires `EXTRACTION_USE_SPEAKER_LABELS=true`).
+    4. Persist the labeled transcript as the displayed content.
     """
     _require_groq()
 
@@ -172,27 +174,45 @@ async def ingest_audio(
             raise HTTPException(status_code=503, detail=str(e)) from e
 
         segments = _copy_segments(detail.get("segments") or [])
-        pyannote_applied = False
-        try:
-            segments, pyannote_applied = await asyncio.to_thread(
-                apply_pyannote_to_segments,
-                tmp_path,
-                segments,
-            )
-        except Exception:
-            pyannote_applied = False
-
-        plain = _rebuild_plain_text_from_segments(segments).strip() or (detail.get("plain_text") or "").strip()
+        plain = (detail.get("plain_text") or "").strip()
+        if not plain and segments:
+            plain = _rebuild_plain_text_from_segments(segments)
         if not plain:
             raise HTTPException(
                 status_code=422,
                 detail="Transcription was empty. Check audio quality or format (FFmpeg may be required).",
             )
 
-        structured = StructuredTranscript(plain_text=plain, segments=segments or [])
+        labeled_segments = segments
+        if segments:
+            try:
+                if settings.groq_label_speakers:
+                    labeled_segments = await asyncio.to_thread(label_segment_speakers, segments)
+                else:
+                    labeled_segments = await asyncio.to_thread(heuristic_speaker_segments, segments)
+                labeled_segments = maybe_relabel_speakers_ab(labeled_segments or segments)
+            except Exception:
+                labeled_segments = segments
+
+        structured = StructuredTranscript(
+            plain_text=plain,
+            segments=labeled_segments or segments or [],
+        )
+        has_speakers = any(
+            (seg.speaker or "").strip() for seg in (structured.segments or [])
+        )
+        display_transcript = (
+            _transcript_with_speaker_labels(structured, plain) if has_speakers else plain
+        )
+
+        extraction_input = (
+            display_transcript
+            if has_speakers and getattr(settings, "extraction_use_speaker_labels", True)
+            else plain
+        )
 
         base = await run_transcript_pipeline(
-            transcript=plain,
+            transcript=extraction_input,
             db=db,
             receiver=_receiver,
             metadata={"filename": file.filename},
@@ -201,42 +221,13 @@ async def ingest_audio(
             structured_transcript=structured,
         )
 
-        out_structured = structured
-        if segments:
-            try:
-                if pyannote_applied:
-                    labeled = [dict(s) for s in segments]
-                elif settings.groq_label_speakers:
-                    labeled = await asyncio.to_thread(label_segment_speakers, segments)
-                else:
-                    labeled = await asyncio.to_thread(heuristic_speaker_segments, segments)
-                labeled = maybe_relabel_speakers_ab(labeled or segments)
-                out_structured = StructuredTranscript(
-                    plain_text=plain,
-                    segments=labeled or segments,
-                )
-                update_crm_record_structured_transcript(
-                    db,
-                    base.record_id,
-                    out_structured,
-                )
-            except Exception:
-                out_structured = structured
-
-        has_speakers = any(
-            (seg.speaker or "").strip() for seg in (out_structured.segments or [])
-        )
-        display_transcript = (
-            _transcript_with_speaker_labels(out_structured, plain)
-            if has_speakers
-            else plain
-        )
         if has_speakers and display_transcript != plain:
             update_crm_record_content(db, base.record_id, display_transcript)
+            update_crm_record_structured_transcript(db, base.record_id, structured)
 
         return build_audio_ingest_response(
             transcript=display_transcript,
-            structured=out_structured,
+            structured=structured,
             base=base,
         )
     finally:

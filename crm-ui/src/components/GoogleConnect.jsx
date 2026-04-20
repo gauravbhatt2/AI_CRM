@@ -1,17 +1,47 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, fetchJson } from "../lib/api.js";
 
-/** Top-bar pill: red = disconnected, green = connected (matches Aura theme). */
+// Module-level cache shared across every GoogleConnect mount in this tab.
+// Avoids the "status called every second" storm caused by React StrictMode
+// double-mount + route remounts + focus refetches.
+const STATUS_CACHE_TTL_MS = 20_000;
+let _statusCache = null; // { at: number, data: { connected: boolean, ... } }
+let _inflight = null;
+
+async function fetchGoogleStatus(force = false) {
+  const now = Date.now();
+  if (!force && _statusCache && now - _statusCache.at < STATUS_CACHE_TTL_MS) {
+    return _statusCache.data;
+  }
+  if (_inflight) return _inflight;
+  _inflight = (async () => {
+    try {
+      const data = await fetchJson(api.google.status);
+      _statusCache = { at: Date.now(), data };
+      return data;
+    } catch (e) {
+      const data = { connected: false };
+      _statusCache = { at: Date.now(), data };
+      throw e;
+    } finally {
+      _inflight = null;
+    }
+  })();
+  return _inflight;
+}
+
+/** Top-bar pill: red = disconnected, green = connected. */
 export default function GoogleConnect() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isConnected, setIsConnected] = useState(
+    Boolean(_statusCache?.data?.connected),
+  );
+  const [isLoading, setIsLoading] = useState(!_statusCache);
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
 
-  const checkStatus = useCallback(async () => {
-    setIsLoading(true);
+  const checkStatus = useCallback(async (force = false) => {
     try {
-      const data = await fetchJson(api.google.status);
+      const data = await fetchGoogleStatus(force);
       setIsConnected(Boolean(data?.connected));
     } catch {
       setIsConnected(false);
@@ -21,11 +51,27 @@ export default function GoogleConnect() {
   }, []);
 
   useEffect(() => {
-    checkStatus();
-  }, [checkStatus]);
+    let cancelled = false;
+    fetchGoogleStatus(false)
+      .then((data) => {
+        if (cancelled) return;
+        setIsConnected(Boolean(data?.connected));
+      })
+      .catch(() => {
+        if (!cancelled) setIsConnected(false);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    const onFocus = () => checkStatus();
+    const onFocus = () => {
+      void checkStatus(false);
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [checkStatus]);
@@ -52,11 +98,12 @@ export default function GoogleConnect() {
     setOpen(false);
     try {
       await fetch(api.google.signout, { method: "POST", mode: "cors" });
+      _statusCache = null;
       setIsConnected(false);
     } catch (e) {
       alert(e instanceof Error ? e.message : "Sign out failed.");
     } finally {
-      await checkStatus();
+      await checkStatus(true);
     }
   };
 
@@ -105,7 +152,7 @@ export default function GoogleConnect() {
             className="block w-full px-4 py-2.5 text-left text-xs font-semibold text-primary hover:bg-surface-container-high"
             onClick={() => {
               setOpen(false);
-              checkStatus();
+              checkStatus(true);
             }}
           >
             Refresh status
