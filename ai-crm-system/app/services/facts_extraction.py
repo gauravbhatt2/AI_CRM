@@ -22,6 +22,10 @@ from app.utils.groq_retry import groq_chat_with_retry
 logger = logging.getLogger(__name__)
 
 FACTS_REQUIRED_TOP: frozenset[str] = frozenset({"statements", "entities", "participants", "timestamps"})
+TOKENS_CHAR_RATIO = 4
+MAX_FACTS_INPUT_TOKENS = 10_000
+FACTS_CHUNK_TOKENS = 800
+FACTS_CHUNK_OVERLAP_TOKENS = 80
 
 _ENT_KEYS_EXPECTED = frozenset(
     {
@@ -109,6 +113,53 @@ def default_facts_payload() -> dict[str, Any]:
 
 def _normalize_scalar_key(s: str) -> str:
     return "".join(c for c in (s or "").lower() if c.isalnum())
+
+
+def _trim_to_token_budget(text: str, max_tokens: int = MAX_FACTS_INPUT_TOKENS) -> str:
+    src = (text or "").strip()
+    if not src:
+        return ""
+    max_chars = max(1, int(max_tokens) * TOKENS_CHAR_RATIO)
+    if len(src) <= max_chars:
+        return src
+    return src[:max_chars].rstrip()
+
+
+def _split_transcript_chunks(
+    transcript: str,
+    *,
+    chunk_tokens: int = FACTS_CHUNK_TOKENS,
+    overlap_tokens: int = FACTS_CHUNK_OVERLAP_TOKENS,
+) -> list[str]:
+    """
+    Sliding-window chunking by approximate token count.
+    Keeps overlap to preserve context across boundaries.
+    """
+    src = (transcript or "").strip()
+    if not src:
+        return []
+    chunk_chars = max(1, int(chunk_tokens) * TOKENS_CHAR_RATIO)
+    overlap_chars = max(0, int(overlap_tokens) * TOKENS_CHAR_RATIO)
+    step = max(1, chunk_chars - overlap_chars)
+    if len(src) <= chunk_chars:
+        return [src]
+
+    chunks: list[str] = []
+    i = 0
+    n = len(src)
+    while i < n:
+        j = min(n, i + chunk_chars)
+        if j < n:
+            space = src.rfind(" ", i + int(chunk_chars * 0.6), j)
+            if space > i:
+                j = space
+        chunk = src[i:j].strip()
+        if chunk:
+            chunks.append(chunk)
+        if j >= n:
+            break
+        i = max(i + step, j - overlap_chars)
+    return chunks or [src]
 
 
 def merge_facts_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
@@ -292,7 +343,7 @@ def _run_single_facts_attempt(prompt: str, *, temperature: float = 0.0) -> tuple
             max_attempts=3,
             temperature=temperature,
             top_p=1.0,
-            max_tokens=8192,
+            max_tokens=2048,
         )
     except Exception:
         logger.exception("Groq facts extraction request failed")
@@ -374,23 +425,36 @@ def run_facts_extraction(transcript: str) -> dict[str, Any]:
     """
     One or two Groq calls for factual JSON (depending on settings.extraction_self_consistency).
     """
-    prompt = build_facts_extraction_prompt(transcript)
-    parsed, ok = _run_single_facts_attempt(prompt, temperature=0.0)
-    if not ok or not parsed:
+    src = _trim_to_token_budget(transcript, MAX_FACTS_INPUT_TOKENS * 20)
+    chunks = _split_transcript_chunks(
+        src,
+        chunk_tokens=FACTS_CHUNK_TOKENS,
+        overlap_tokens=FACTS_CHUNK_OVERLAP_TOKENS,
+    )
+    if not chunks:
         return default_facts_payload()
 
-    if not getattr(settings, "extraction_self_consistency", False):
-        return parsed
+    chunk_payloads: list[dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        bounded = _trim_to_token_budget(chunk, MAX_FACTS_INPUT_TOKENS)
+        prompt = build_facts_extraction_prompt(bounded)
+        parsed, ok = _run_single_facts_attempt(prompt, temperature=0.0)
+        if not ok or not parsed:
+            logger.warning("Facts extraction failed for chunk %s/%s", idx, len(chunks))
+            continue
 
-    alt, ok_alt = _run_single_facts_attempt(prompt, temperature=0.2)
-    if not ok_alt or not alt:
-        return parsed
+        if getattr(settings, "extraction_self_consistency", False):
+            alt, ok_alt = _run_single_facts_attempt(prompt, temperature=0.2)
+            if ok_alt and alt:
+                try:
+                    parsed = _reconcile_facts_consistency(parsed, alt)
+                except Exception:
+                    logger.exception("Chunk self-consistency failed; using primary chunk pass")
+        chunk_payloads.append(parsed)
 
-    try:
-        return _reconcile_facts_consistency(parsed, alt)
-    except Exception:
-        logger.exception("Self-consistency reconciliation failed; using primary pass")
-        return parsed
+    if not chunk_payloads:
+        return default_facts_payload()
+    return merge_facts_payloads(chunk_payloads)
 
 
 def heuristics_facts_from_transcript(transcript: str) -> dict[str, Any]:

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
+TOKENS_CHAR_RATIO = 4
+MAX_GROQ_INPUT_TOKENS = 10_000
+
 # ---------------------------------------------------------------------------
 # Phase 1 — factual extraction only (no intent, pain, scoring)
 # ---------------------------------------------------------------------------
@@ -86,22 +89,30 @@ Rules:
 MERGED_FACTS_JSON:
 {merged_facts}"""
 
-TRANSCRIPT_LLM_MAX_CHARS = 120_000
+TRANSCRIPT_LLM_MAX_CHARS = MAX_GROQ_INPUT_TOKENS * TOKENS_CHAR_RATIO
+
+
+def _trim_to_token_budget(text: str, max_tokens: int = MAX_GROQ_INPUT_TOKENS) -> str:
+    """Approximate token budget with chars/4 and trim conservatively."""
+    src = (text or "").strip()
+    if not src:
+        return ""
+    max_chars = max(1, int(max_tokens) * TOKENS_CHAR_RATIO)
+    if len(src) <= max_chars:
+        return src
+    return src[:max_chars].rstrip()
 
 
 def build_facts_extraction_prompt(transcript: str) -> str:
-    t = (transcript or "").strip()
+    t = _trim_to_token_budget(transcript, MAX_GROQ_INPUT_TOKENS)
     if len(t) > TRANSCRIPT_LLM_MAX_CHARS:
-        t = (
-            t[: TRANSCRIPT_LLM_MAX_CHARS // 2]
-            + "\n\n[... middle omitted for length ...]\n\n"
-            + t[-(TRANSCRIPT_LLM_MAX_CHARS // 2) :]
-        )
+        t = t[:TRANSCRIPT_LLM_MAX_CHARS]
     return FACTS_EXTRACTION_PROMPT_TEMPLATE.replace("{transcript}", t)
 
 
 def build_evaluation_prompt(merged_facts_json: str) -> str:
-    return EVALUATION_PROMPT_TEMPLATE.replace("{merged_facts}", (merged_facts_json or "").strip()[:28000])
+    compact = _trim_to_token_budget(merged_facts_json, MAX_GROQ_INPUT_TOKENS)
+    return EVALUATION_PROMPT_TEMPLATE.replace("{merged_facts}", compact)
 
 
 def build_unified_extraction_prompt(transcript: str) -> str:

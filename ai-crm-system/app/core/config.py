@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     #   small / medium      : balanced; WER ~4%
     #   large-v3 / large-v3-turbo : slowest; WER ~3%
     # Default `small` (balanced profile) — override via WHISPER_MODEL env.
+    # Use an absolute path to a pre-downloaded CTranslate2 model directory to run
+    # ASR with no Hugging Face Hub access at runtime (copy the folder from another
+    # machine or mirror). Size names (small, base, …) may download from Hub once.
     whisper_model: str = "small"
 
     # ISO language hint; skips auto-detection (saves 1-3s per call).

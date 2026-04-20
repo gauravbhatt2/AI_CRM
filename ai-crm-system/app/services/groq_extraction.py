@@ -112,6 +112,14 @@ def _is_na_token(value: Any) -> bool:
     return s in ("", "n/a", "na", "none", "null", "unknown")
 
 
+def _is_missing_value(value: Any) -> bool:
+    if _is_na_token(value):
+        return True
+    if isinstance(value, (list, dict)):
+        return len(value) == 0
+    return False
+
+
 def _strip_markdown_fences(raw: str) -> str:
     text = raw.strip()
     if text.startswith("```"):
@@ -414,6 +422,22 @@ def _finalize_two_phase(
 
     grounding_enabled = bool(getattr(settings, "extraction_require_evidence", True))
     merged, _rejected = ground_extracted_entities(merged, src, enabled=grounding_enabled)
+
+    # Recovery pass for still-missing fields. It only receives structured outputs
+    # (no raw transcript), and we re-apply evidence grounding before accepting.
+    try:
+        from app.services.missing_field_recovery import recover_missing_fields
+
+        recovery_patch = recover_missing_fields(merged, llm_ai, merged_facts)
+        if recovery_patch:
+            trial = dict(merged)
+            trial.update(recovery_patch)
+            grounded_trial, _rej2 = ground_extracted_entities(trial, src, enabled=grounding_enabled)
+            for k, _v in recovery_patch.items():
+                if _is_missing_value(merged.get(k)) and not _is_missing_value(grounded_trial.get(k)):
+                    merged[k] = grounded_trial.get(k)
+    except Exception:
+        logger.exception("Missing-field recovery failed; continuing with grounded extraction")
 
     ai = run_ai_intelligence(src, merged, llm_primary=llm_ai)
     return merged, ai, merged_facts
