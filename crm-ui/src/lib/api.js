@@ -16,8 +16,8 @@ export const api = {
   agentsNext: (id) => `${API_BASE_URL}/api/v1/agents/next-action/${id}`,
   agentsFollowup: (id) => `${API_BASE_URL}/api/v1/agents/followup/${id}`,
   google: {
-    status: `${API_BASE_URL}/api/v1/google/status/`,
-    auth: `${API_BASE_URL}/api/v1/google/auth/`,
+    status: `${API_BASE_URL}/api/v1/google/status`,
+    auth: `${API_BASE_URL}/api/v1/google/auth`,
     signout: `${API_BASE_URL}/api/v1/google/auth/signout`,
     gmailGenerate: `${API_BASE_URL}/api/v1/google/gmail/generate`,
     gmailSend: `${API_BASE_URL}/api/v1/google/gmail/send`,

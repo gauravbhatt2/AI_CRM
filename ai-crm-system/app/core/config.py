@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -165,58 +165,17 @@ class Settings(BaseSettings):
         description="Browser URL after OAuth callback (must match a registered redirect URI)",
     )
 
-    # Cache window (seconds) for the /google/status probe so the TopBar pill
-    # does not hit Google on every React re-render / dev-mode remount.
-    google_status_cache_ttl_sec: float = 20.0
-
-    # Response compression kicks in for payloads >= this threshold (bytes).
-    gzip_min_size_bytes: int = 1024
-
-
-_WHISPER_PROFILES: dict[str, dict[str, object]] = {
-    "fast": {
-        "whisper_model": "base",
-        "whisper_fast_decode": True,
-        "whisper_beam_size": 1,
-        "groq_label_speakers": False,
-        "extraction_self_consistency": False,
-    },
-    "balanced": {
-        "whisper_model": "small",
-        "whisper_fast_decode": False,
-        "whisper_beam_size": 5,
-        "groq_label_speakers": True,
-        "extraction_self_consistency": True,
-    },
-    "quality": {
-        "whisper_model": "large-v3",
-        "whisper_fast_decode": False,
-        "whisper_beam_size": 5,
-        "groq_label_speakers": True,
-        "extraction_self_consistency": True,
-    },
-}
-
-
-def _apply_whisper_profile(s: Settings) -> Settings:
-    """Apply WHISPER_PROFILE defaults, but only where the user did not set an explicit env var."""
-    import os
-
-    profile = (s.whisper_profile or "").strip().lower()
-    if profile not in _WHISPER_PROFILES:
-        return s
-    preset = _WHISPER_PROFILES[profile]
-    env_override = {
-        "whisper_model": "WHISPER_MODEL",
-        "whisper_fast_decode": "WHISPER_FAST_DECODE",
-        "whisper_beam_size": "WHISPER_BEAM_SIZE",
-        "groq_label_speakers": "GROQ_LABEL_SPEAKERS",
-        "extraction_self_consistency": "EXTRACTION_SELF_CONSISTENCY",
-    }
-    for attr, value in preset.items():
-        if os.environ.get(env_override[attr]) is None:
-            setattr(s, attr, value)
-    return s
+    @field_validator("debug", mode="before")
+    @classmethod
+    def normalize_debug(cls, value):
+        """Accept common deployment strings from shared shell environments."""
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production"}:
+                return False
+            if normalized in {"debug", "dev", "development"}:
+                return True
+        return value
 
 
 @lru_cache

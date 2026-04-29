@@ -45,7 +45,7 @@ Create **`ai-crm-system/.env`** (never commit secrets):
 | `WHISPER_COMPUTE_TYPE` | Empty = auto (`int8` on CPU, `float16` on CUDA). Can override with `int8_float16`, `float32`, etc. |
 | `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` | Optional; deal chat |
 | `HUBSPOT_API_KEY` | Optional; HubSpot deal/contact/company sync |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Optional; Google OAuth |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Optional; Google OAuth for Gmail + Calendar routes. Example: `http://127.0.0.1:8001/api/v1/google/auth/callback` |
 
 ```bash
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -127,11 +127,12 @@ npm run build    # output in dist/ (listed in .gitignore)
 
 | Issue | What to check |
 |-------|----------------|
-| `503` on ingest | `GROQ_API_KEY`, `GROQ_MODEL`, DB reachable |
-| `Failed to fetch` in UI | Backend running, port, CORS, `VITE_API_URL` |
-| Whisper / FFmpeg | Install FFmpeg and restart shell — `ffmpeg -version` |
-| Slow first audio upload | The `base` model downloads once (~140 MB). Subsequent calls are cached in the process. |
-| Chat always "Not available" | Set `OPENROUTER_API_KEY` or rely on Groq fallback |
+| `503` on ingest | `GROQ_API_KEY`, `GROQ_MODEL`, DB |
+| `Failed to fetch` in UI | API running, port, CORS, `VITE_API_URL` |
+| Whisper / FFmpeg | Install FFmpeg; restart shell |
+| pyannote errors | `pip install` includes torch/pyannote; HF token; model license; or set `PYANNOTE_ENABLED=false` |
+| Chat always “Not available” | Set `OPENROUTER_API_KEY` or rely on Groq fallback |
+| Google sign-in shows `redirect_uri_mismatch` | Register the exact backend callback in Google Cloud and make it match backend `.env` exactly, including host and port, e.g. `http://127.0.0.1:8001/api/v1/google/auth/callback` |
 | Google features disabled | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` in backend `.env` |
 
 ## Repo hygiene
