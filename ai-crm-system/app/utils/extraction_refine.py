@@ -54,40 +54,41 @@ def infer_budget_hint(transcript: str) -> str | None:
     """
     Infer a conservative numeric budget from transcript.
 
-    Avoids over-scaling plain values such as '99 dollars' into thousands.
+    Handles numerics + k/m/b, spelled-out numbers ('seventy five thousand'),
+    and Indian units ('5 lakh', '2 crore'). Avoids over-scaling plain values
+    such as '99 dollars' into thousands.
     """
     t = (transcript or "").strip()
     if not t:
         return None
 
-    # Budget-specific context first.
+    from app.utils.money_parser import parse_money_to_int
+
     ctx = re.search(
-        r"\bbudget\b.{0,40}?([₹$€]?\s*\d+(?:[.,]\d+)?)(?:\s*([kKmM]))?",
+        r"\bbudget\b(?:\s+is)?\s*[:=]?\s*(?:about|around|roughly|approximately)?\s*"
+        r"([^.,;\n]{1,120})",
         t,
         flags=re.I,
     )
     if ctx:
-        amount = _money_to_int(ctx.group(1), ctx.group(2) or "")
-        if amount:
-            return str(_correct_consumer_map_price_noise(t, int(amount)))
+        candidate = ctx.group(1).strip()
+        amt = parse_money_to_int(candidate)
+        if amt:
+            return str(_correct_consumer_map_price_noise(t, int(amt)))
 
-    # Explicit currency amount.
-    cur = re.search(
-        r"(?:₹|\$|€|usd|inr)\s*(\d+(?:[.,]\d+)?)(?:\s*([kKmM]))?\b",
-        t,
-        flags=re.I,
-    )
-    if cur:
-        amount = _money_to_int(cur.group(1), cur.group(2) or "")
-        if amount:
-            return str(_correct_consumer_map_price_noise(t, int(amount)))
-
-    # Number with explicit k/m suffix.
-    short = re.search(r"\b(\d+(?:[.,]\d+)?)\s*([kKmM])\b", t)
-    if short:
-        amount = _money_to_int(short.group(1), short.group(2))
-        if amount:
-            return amount
+    for pat in (
+        r"(?:\$|\u00a3|\u20ac|\u20b9|rs\.?|inr|usd|eur|gbp)\s*"
+        r"\d+(?:[.,]\d+)?\s*(?:k|m|mn|million|thousand|lakhs?|crores?|cr|bn|billion)?",
+        r"\d+(?:[.,]\d+)?\s*(?:k|m|mn|million|lakhs?|crores?|cr|bn|billion)\b",
+        r"\b(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|fifteen|twenty|thirty|forty|fifty|sixty|seventy|"
+        r"eighty|ninety|hundred|and|a|half)\s+){1,6}"
+        r"(?:thousand|lakhs?|million|crores?|billion)\b",
+    ):
+        for m in re.finditer(pat, t, flags=re.I):
+            amt = parse_money_to_int(m.group(0))
+            if amt:
+                return str(_correct_consumer_map_price_noise(t, int(amt)))
 
     return None
 

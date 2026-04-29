@@ -18,6 +18,8 @@ from app.services.groq_llm import get_groq_client
 from app.utils.groq_retry import groq_chat_with_retry
 
 logger = logging.getLogger(__name__)
+TOKENS_CHAR_RATIO = 4
+MAX_EVAL_INPUT_TOKENS = 10_000
 
 EVAL_REQUIRED_KEYS: frozenset[str] = frozenset(
     {
@@ -145,7 +147,10 @@ def run_evaluation_groq(merged_facts: dict[str, Any]) -> dict[str, Any] | None:
     except RuntimeError:
         return None
 
-    facts_json = json.dumps(merged_facts, ensure_ascii=False)[:28000]
+    facts_json = json.dumps(merged_facts, ensure_ascii=False)
+    max_chars = MAX_EVAL_INPUT_TOKENS * TOKENS_CHAR_RATIO
+    if len(facts_json) > max_chars:
+        facts_json = facts_json[:max_chars]
     prompt = build_evaluation_prompt(facts_json)
     try:
         raw = groq_chat_with_retry(
@@ -154,7 +159,7 @@ def run_evaluation_groq(merged_facts: dict[str, Any]) -> dict[str, Any] | None:
             max_attempts=3,
             temperature=0.0,
             top_p=1.0,
-            max_tokens=4096,
+            max_tokens=2048,
         )
     except Exception:
         logger.exception("Groq evaluation request failed")

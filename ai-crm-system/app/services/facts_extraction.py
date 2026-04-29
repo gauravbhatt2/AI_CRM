@@ -22,6 +22,10 @@ from app.utils.groq_retry import groq_chat_with_retry
 logger = logging.getLogger(__name__)
 
 FACTS_REQUIRED_TOP: frozenset[str] = frozenset({"statements", "entities", "participants", "timestamps"})
+TOKENS_CHAR_RATIO = 4
+MAX_FACTS_INPUT_TOKENS = 10_000
+FACTS_CHUNK_TOKENS = 800
+FACTS_CHUNK_OVERLAP_TOKENS = 80
 
 _ENT_KEYS_EXPECTED = frozenset(
     {
@@ -109,6 +113,53 @@ def default_facts_payload() -> dict[str, Any]:
 
 def _normalize_scalar_key(s: str) -> str:
     return "".join(c for c in (s or "").lower() if c.isalnum())
+
+
+def _trim_to_token_budget(text: str, max_tokens: int = MAX_FACTS_INPUT_TOKENS) -> str:
+    src = (text or "").strip()
+    if not src:
+        return ""
+    max_chars = max(1, int(max_tokens) * TOKENS_CHAR_RATIO)
+    if len(src) <= max_chars:
+        return src
+    return src[:max_chars].rstrip()
+
+
+def _split_transcript_chunks(
+    transcript: str,
+    *,
+    chunk_tokens: int = FACTS_CHUNK_TOKENS,
+    overlap_tokens: int = FACTS_CHUNK_OVERLAP_TOKENS,
+) -> list[str]:
+    """
+    Sliding-window chunking by approximate token count.
+    Keeps overlap to preserve context across boundaries.
+    """
+    src = (transcript or "").strip()
+    if not src:
+        return []
+    chunk_chars = max(1, int(chunk_tokens) * TOKENS_CHAR_RATIO)
+    overlap_chars = max(0, int(overlap_tokens) * TOKENS_CHAR_RATIO)
+    step = max(1, chunk_chars - overlap_chars)
+    if len(src) <= chunk_chars:
+        return [src]
+
+    chunks: list[str] = []
+    i = 0
+    n = len(src)
+    while i < n:
+        j = min(n, i + chunk_chars)
+        if j < n:
+            space = src.rfind(" ", i + int(chunk_chars * 0.6), j)
+            if space > i:
+                j = space
+        chunk = src[i:j].strip()
+        if chunk:
+            chunks.append(chunk)
+        if j >= n:
+            break
+        i = max(i + step, j - overlap_chars)
+    return chunks or [src]
 
 
 def merge_facts_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
@@ -282,7 +333,7 @@ def _normalize_facts_shape(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _run_single_facts_attempt(prompt: str) -> tuple[dict[str, Any] | None, bool]:
+def _run_single_facts_attempt(prompt: str, *, temperature: float = 0.0) -> tuple[dict[str, Any] | None, bool]:
     if not (settings.groq_model or "").strip():
         return None, False
     try:
@@ -290,9 +341,9 @@ def _run_single_facts_attempt(prompt: str) -> tuple[dict[str, Any] | None, bool]
             prompt,
             json_mode=True,
             max_attempts=3,
-            temperature=0.0,
+            temperature=temperature,
             top_p=1.0,
-            max_tokens=8192,
+            max_tokens=2048,
         )
     except Exception:
         logger.exception("Groq facts extraction request failed")
@@ -308,14 +359,102 @@ def _run_single_facts_attempt(prompt: str) -> tuple[dict[str, Any] | None, bool]
     return _normalize_facts_shape(parsed), True
 
 
+_SC_AMBIGUOUS_FIELDS: frozenset[str] = frozenset(
+    {"budget", "product", "product_version", "timeline", "procurement_stage", "implementation_scope"}
+)
+
+
+def _reconcile_facts_consistency(primary: dict[str, Any], alternate: dict[str, Any]) -> dict[str, Any]:
+    """
+    Merge two facts payloads with disagreement-aware reconciliation on ambiguous fields.
+
+    - Agreement -> keep primary value.
+    - Disagreement -> blank the field (prefer "n/a" + logged).
+    - One is "n/a" and the other isn't -> keep the non-empty value.
+    - Lists (competitors/stakeholders) -> union via existing merge_facts_payloads.
+    """
+    merged = merge_facts_payloads([primary, alternate])
+    ent_p = primary.get("entities") if isinstance(primary.get("entities"), dict) else {}
+    ent_a = alternate.get("entities") if isinstance(alternate.get("entities"), dict) else {}
+    ent_m = merged.get("entities") if isinstance(merged.get("entities"), dict) else {}
+
+    def _norm(v: Any) -> str:
+        return str(v or "").strip().lower()
+
+    disagreements: list[str] = []
+    for f in _SC_AMBIGUOUS_FIELDS:
+        vp = ent_p.get(f)
+        va = ent_a.get(f)
+        np_ = _norm(vp)
+        na_ = _norm(va)
+        if not np_ and not na_:
+            continue
+        if np_ in ("n/a", "na", "none") and na_ in ("n/a", "na", "none", ""):
+            ent_m[f] = "" if f == "budget" else "n/a"
+            continue
+        if not np_ or np_ in ("n/a", "na", "none"):
+            ent_m[f] = va if isinstance(va, (int, float)) else (str(va) if va is not None else "")
+            continue
+        if not na_ or na_ in ("n/a", "na", "none"):
+            ent_m[f] = vp if isinstance(vp, (int, float)) else (str(vp) if vp is not None else "")
+            continue
+        if np_ == na_:
+            ent_m[f] = vp
+            continue
+        if f == "budget":
+            from app.utils.money_parser import parse_money_to_int
+
+            bp = parse_money_to_int(vp)
+            ba = parse_money_to_int(va)
+            if bp is not None and ba is not None and bp > 0 and ba > 0:
+                ratio = min(bp, ba) / max(bp, ba)
+                if ratio >= 0.8:
+                    ent_m[f] = bp
+                    continue
+        disagreements.append(f)
+        ent_m[f] = "" if f == "budget" else ""
+
+    if disagreements:
+        logger.info("Self-consistency disagreed on %s; blanked.", ", ".join(disagreements))
+
+    merged["entities"] = ent_m
+    return merged
+
+
 def run_facts_extraction(transcript: str) -> dict[str, Any]:
     """
-    Single Groq call for factual JSON. Requires Groq client configured.
+    One or two Groq calls for factual JSON (depending on settings.extraction_self_consistency).
     """
-    parsed, ok = _run_single_facts_attempt(build_facts_extraction_prompt(transcript))
-    if ok and parsed:
-        return parsed
-    return default_facts_payload()
+    src = _trim_to_token_budget(transcript, MAX_FACTS_INPUT_TOKENS * 20)
+    chunks = _split_transcript_chunks(
+        src,
+        chunk_tokens=FACTS_CHUNK_TOKENS,
+        overlap_tokens=FACTS_CHUNK_OVERLAP_TOKENS,
+    )
+    if not chunks:
+        return default_facts_payload()
+
+    chunk_payloads: list[dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        bounded = _trim_to_token_budget(chunk, MAX_FACTS_INPUT_TOKENS)
+        prompt = build_facts_extraction_prompt(bounded)
+        parsed, ok = _run_single_facts_attempt(prompt, temperature=0.0)
+        if not ok or not parsed:
+            logger.warning("Facts extraction failed for chunk %s/%s", idx, len(chunks))
+            continue
+
+        if getattr(settings, "extraction_self_consistency", False):
+            alt, ok_alt = _run_single_facts_attempt(prompt, temperature=0.2)
+            if ok_alt and alt:
+                try:
+                    parsed = _reconcile_facts_consistency(parsed, alt)
+                except Exception:
+                    logger.exception("Chunk self-consistency failed; using primary chunk pass")
+        chunk_payloads.append(parsed)
+
+    if not chunk_payloads:
+        return default_facts_payload()
+    return merge_facts_payloads(chunk_payloads)
 
 
 def heuristics_facts_from_transcript(transcript: str) -> dict[str, Any]:

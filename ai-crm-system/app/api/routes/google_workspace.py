@@ -1,7 +1,9 @@
-"""HTTP routes for Google Workspace (Gmail + Calendar), from mailNDcalendar branch."""
+"""HTTP routes for Google Workspace (Gmail + Calendar)."""
 
 import datetime
 import json as _json
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -19,6 +21,11 @@ import app.services.google_service as google_service
 router = APIRouter(tags=["Google Workspace Integration"])
 
 oauth_states: dict = {}
+
+# Tiny in-process TTL cache so the TopBar pill (which remounts under React
+# StrictMode and on every tab focus) doesn't hammer Google on every render.
+_status_cache_lock = threading.Lock()
+_status_cache: dict[str, tuple[float, dict]] = {}
 
 
 class EmailMessageSchema(BaseModel):
@@ -73,6 +80,7 @@ def auth_google_callback(state: str, code: str, db: Session = Depends(get_db)):
         creds = flow.credentials
         google_service.save_credentials(db, creds)
         del oauth_states[state]
+        _invalidate_status_cache()
 
         redirect = (settings.google_oauth_success_redirect or "http://localhost:5173/").strip()
         return RedirectResponse(url=redirect)
@@ -84,12 +92,16 @@ def auth_google_callback(state: str, code: str, db: Session = Depends(get_db)):
 def signout_google(db: Session = Depends(get_db)):
     """Clear stored Google OAuth credentials (disconnect in this app)."""
     google_service.clear_credentials(db)
+    _invalidate_status_cache()
     return {"status": "signed_out"}
 
 
-@router.get("/status")
-def check_google_status(db: Session = Depends(get_db)):
-    """Check if saved Google credentials work with a live tokeninfo call."""
+def _invalidate_status_cache() -> None:
+    with _status_cache_lock:
+        _status_cache.clear()
+
+
+def _compute_google_status(db: Session) -> dict:
     try:
         creds = google_service.get_credentials_for_user(db)
         if not creds:
@@ -102,7 +114,7 @@ def check_google_status(db: Session = Depends(get_db)):
                 creds.refresh(Request())
                 google_service.save_credentials(db, creds)
             except Exception as refresh_err:
-                return {"connected": False, "reason": f"Token refresh failed: {str(refresh_err)}"}
+                return {"connected": False, "reason": f"Token refresh failed: {refresh_err}"}
 
         if not creds.token:
             return {"connected": False, "reason": "No access token"}
@@ -129,6 +141,26 @@ def check_google_status(db: Session = Depends(get_db)):
             return {"connected": False, "reason": str(live_err)}
     except Exception as e:
         return {"connected": False, "reason": str(e)}
+
+
+@router.get("/status/")
+def check_google_status(db: Session = Depends(get_db)):
+    """Check if saved Google credentials work. Results are cached briefly to avoid hammering Google."""
+    ttl = float(getattr(settings, "google_status_cache_ttl_sec", 20.0) or 0.0)
+    now = time.monotonic()
+
+    if ttl > 0:
+        with _status_cache_lock:
+            cached = _status_cache.get("global")
+            if cached and (now - cached[0]) < ttl:
+                return cached[1]
+
+    result = _compute_google_status(db)
+
+    if ttl > 0:
+        with _status_cache_lock:
+            _status_cache["global"] = (time.monotonic(), result)
+    return result
 
 
 @router.post("/gmail/generate")

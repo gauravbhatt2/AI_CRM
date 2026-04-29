@@ -1,10 +1,10 @@
-# CRM_AI — AI-assisted CRM ingestion
+# AI CRM — AI-assisted CRM ingestion
 
-Monorepo: **FastAPI** backend (PostgreSQL, Groq LLM, optional pyannote + OpenRouter + Google OAuth) and **Vite + React** dashboard.
+Monorepo: **FastAPI** backend (PostgreSQL, Groq LLM, OpenRouter, Google OAuth) and **Vite + React** dashboard. Optimised for low-latency ingestion — no torch, no pyannote, no 1.5 GB model downloads on first run.
 
 | Path | Role |
 |------|------|
-| `ai-crm-system/` | Python API: ingestion, two-phase extraction (single-pass facts → evaluation), CRM mapping, HubSpot sync, agents, optional Google Workspace |
+| `ai-crm-system/` | Python API: ingestion, two-phase extraction (facts → evaluation), CRM mapping, HubSpot sync, agents, Google Workspace |
 | `crm-ui/` | React SPA (React Router): upload, records, analytics, chat, settings |
 | `ai-crm-system/docs/` | **BRD_AI_CRM.md** (business), **PRD_AI_CRM.md** (product / API / data model) |
 
@@ -13,11 +13,10 @@ Monorepo: **FastAPI** backend (PostgreSQL, Groq LLM, optional pyannote + OpenRou
 - **Python 3.11+** (venv recommended)
 - **Node.js 20+** and npm
 - **PostgreSQL** (`DATABASE_URL`)
-- **FFmpeg** on `PATH` (recommended for Whisper decoding many formats)
-- **Groq API key** — extraction & evaluation (required for ingest)
-- **Optional:** Hugging Face token — pyannote speaker diarization (accept model license on HF)
-- **Optional:** OpenRouter API key — deal chat (Gemma); falls back to Groq if unset/failing
-- **Optional:** Google OAuth client id/secret + redirect — Gmail/Calendar features under `/api/v1/google/` when configured
+- **FFmpeg** on `PATH` (required by faster-whisper to decode non-WAV audio)
+- **Groq API key** — required for ingestion (extraction + evaluation)
+- **Optional:** OpenRouter API key — deal chat; falls back to Groq if unset
+- **Optional:** Google OAuth client id/secret/redirect — Gmail/Calendar under `/api/v1/google/`
 
 ## Backend (`ai-crm-system`)
 
@@ -36,27 +35,79 @@ Create **`ai-crm-system/.env`** (never commit secrets):
 | `DATABASE_URL` | PostgreSQL URL |
 | `GROQ_API_KEY` | [Groq Console](https://console.groq.com/keys) |
 | `GROQ_MODEL` | e.g. `llama-3.3-70b-versatile` |
-| `WHISPER_MODEL` | Default **`turbo`** (large-v3-turbo; faster than `large` / `large-v3` for English). Alternatives: `tiny`, `base`, `small`, `medium`, `large`, `large-v3` |
-| `WHISPER_LANGUAGE` | Default `en` — skips Whisper auto language detection (English-only) |
-| `HUGGINGFACE_TOKEN` | Optional; enables **pyannote** diarization (`PYANNOTE_ENABLED=true`) |
-| `OPENROUTER_API_KEY` | Optional; **deal chat** via OpenRouter |
-| `OPENROUTER_MODEL` | e.g. `google/gemma-3-12b-it:free` |
-| `GROQ_LABEL_SPEAKERS` | Extra Groq call for labels if pyannote did not run (default `true`) |
+| `GROQ_LABEL_SPEAKERS` | Default **`false`** (heuristic labeler is instant; enable only when LLM speaker labels matter) |
+| `WHISPER_MODEL` | Default **`base`**. Options: `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `WHISPER_LANGUAGE` | Default `en` — skips language auto-detection |
+| `WHISPER_FAST_DECODE` | Default `true` (beam_size=1, much faster) |
+| `WHISPER_BEAM_SIZE` | Only read when `WHISPER_FAST_DECODE=false` |
+| `WHISPER_VAD` | Default `true` — Voice Activity Detection prunes silence |
+| `WHISPER_DEVICE` | `auto` (default), `cpu`, or `cuda` |
+| `WHISPER_COMPUTE_TYPE` | Empty = auto (`int8` on CPU, `float16` on CUDA). Can override with `int8_float16`, `float32`, etc. |
+| `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` | Optional; deal chat |
 | `HUBSPOT_API_KEY` | Optional; HubSpot deal/contact/company sync |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Optional; Google OAuth for Gmail + Calendar routes. Example: `http://127.0.0.1:8001/api/v1/google/auth/callback` |
 
 ```bash
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 - OpenAPI: `http://127.0.0.1:8000/docs`
 
-### Pipeline (conceptual)
+### Pipeline
 
-1. **Audio:** Whisper transcription → optional **pyannote** diarization (Speaker A/B) merged to segments → optional Groq/heuristic speaker labels if pyannote off.
-2. **Text/audio:** Transcript → **factual extraction** (Groq, single call; very long text is truncated with middle omitted) → **merge with heuristic hints** → **evaluation** (Groq, from merged facts JSON) → refiners → AI intelligence → CRM mapping → persist → audit.
-3. **Agents:** `POST /api/v1/agents/chat` — OpenRouter when configured (structured CRM fields only, no raw transcript); Groq fallback. Also **next-action** and **follow-up** endpoints.
-4. **Google (optional):** OAuth + on-demand Gmail/Calendar actions — not automatic full inbox sync.
+1. **Audio:** `faster-whisper` transcribes the file (CTranslate2 backend, INT8 on CPU by default) and emits timestamped segments. Speaker labels are applied by a fast rule-based labeler; set `GROQ_LABEL_SPEAKERS=true` to use Groq for higher-quality labels at the cost of one extra roundtrip.
+2. **Text/audio:** transcript → **factual extraction** (single Groq JSON call, long inputs truncated with middle omitted) → **merge with heuristic hints** → **evaluation** (Groq JSON from merged facts) → deterministic refiners → AI intelligence → CRM mapping → persist → audit.
+3. **Agents:** `POST /api/v1/agents/chat` (OpenRouter preferred, Groq fallback), `POST /api/v1/agents/next-action/{id}`, `POST /api/v1/agents/followup/{id}`.
+4. **Google (optional):** OAuth + on-demand Gmail/Calendar actions — no automatic inbox sync.
+
+### Performance notes
+
+- Responses are **gzip-compressed** (1 KB threshold) by the FastAPI middleware.
+- `/api/v1/google/status/` is **cached for ~20 s** in-process (and in the browser) so the TopBar pill cannot hammer Google on every remount / focus event.
+- Default Whisper stack (`base` model + `int8` + `beam=1` + VAD) typically transcribes 1 minute of audio in **~3–6 seconds on CPU**; large-v3 needs 5–10× more time.
+- No torch / no pyannote / no CUDA runtime required for CPU deployment.
+
+### Speed vs accuracy — what to tune
+
+The system ships with `WHISPER_PROFILE=balanced` by default. Flip the single env
+variable to `fast` or `quality` and every related flag is set for you; any explicit
+`WHISPER_MODEL`/`WHISPER_BEAM_SIZE`/`WHISPER_FAST_DECODE`/`GROQ_LABEL_SPEAKERS`
+env var overrides the profile preset.
+
+| Profile | Whisper model | Beam | Speaker labels (Groq) | Two-pass extraction | Approx. WER | Relative ingest speed |
+|---------|---------------|------|-----------------------|---------------------|-------------|-----------------------|
+| `fast` | `base` | 1 | off | off | ~6% | 1× (baseline) |
+| `balanced` **(default)** | `small` | 5 | on | on | ~4% | 0.5× |
+| `quality` | `large-v3` | 5 | on | on | ~3% | 0.1–0.15× |
+
+Accuracy knobs beyond the profile:
+
+| Knob | Default | What it does |
+|------|---------|--------------|
+| `EXTRACTION_REQUIRE_EVIDENCE` | `true` | Blank any LLM-extracted field whose value is not a literal substring of the transcript. Kills hallucinations. |
+| `EXTRACTION_SELF_CONSISTENCY` | `true` (balanced/quality) | Run Groq facts extraction twice (`t=0.0` and `t=0.2`) and blank fields where the two passes disagree. |
+| `EXTRACTION_USE_SPEAKER_LABELS` | `true` | Feed the speaker-labeled transcript (`[00:12] Customer: …`) into Groq so Sales vs Customer attribution is unambiguous. Audio path only. |
+| `ACCOUNT_FUZZY_MATCH_THRESHOLD` | `88` | Token-set ratio (0–100) below which a new company name is treated as a new Account. Prevents "Acme Corp" / "Acme Inc." duplicates. |
+| `EXTRACTION_CACHE_SIZE` | `64` | In-process SHA256 cache of identical transcripts — re-ingests return the cached extraction with zero Groq/Whisper cost. |
+| `WHISPER_VAD_MIN_SILENCE_MS` | `500` | Tighter VAD threshold — drops more silent noise before decoding. |
+| `WHISPER_LOG_PROB_THRESHOLD` | `-1.0` | Reject Whisper segments with avg log-probability below this. Set to `-0.5` for stricter filtering on noisy audio. |
+
+Three common `.env` profiles:
+
+```bash
+# FAST - dashboards, internal demos, low-latency ingestion
+WHISPER_PROFILE=fast
+
+# BALANCED (default) - production CRM, speaker-aware extraction, evidence grounding
+WHISPER_PROFILE=balanced
+
+# QUALITY - noisy audio, multi-speaker calls, legal/compliance
+WHISPER_PROFILE=quality
+```
+
+Non-audio extraction accuracy (budget normalization, Indian units like `lakh`/`crore`,
+CRM dedup, evidence grounding, speaker-aware prompts) applies to **every** profile
+and every ingest channel (audio, transcript, email, meeting, SMS, CRM update).
 
 ## Frontend (`crm-ui`)
 
@@ -66,10 +117,10 @@ npm install
 npm run dev
 ```
 
-Default: `http://127.0.0.1:5173`. Set **`VITE_API_URL`** (e.g. in `.env`) to point at the backend if it is not `http://127.0.0.1:8000`. See `src/lib/api.js` and `app/core/config.py` for CORS.
+Default: `http://127.0.0.1:5173`. Set **`VITE_API_URL`** (e.g. in `.env`) to point at the backend if it is not `http://127.0.0.1:8000`.
 
 ```bash
-npm run build    # output in dist/ (listed in .gitignore — do not commit)
+npm run build    # output in dist/ (listed in .gitignore)
 ```
 
 ## Troubleshooting
@@ -86,9 +137,9 @@ npm run build    # output in dist/ (listed in .gitignore — do not commit)
 
 ## Repo hygiene
 
-- **`crm-ui/dist/`** — build artifact; gitignored. Regenerate with `npm run build`.
+- **`crm-ui/dist/`** — build artifact; gitignored.
 - **`node_modules/`**, **`.env`** — not committed.
-- Requirements and behavior are defined in **`ai-crm-system/docs/BRD_AI_CRM.md`** and **`ai-crm-system/docs/PRD_AI_CRM.md`** only.
+- Business / product requirements live in **`ai-crm-system/docs/BRD_AI_CRM.md`** and **`ai-crm-system/docs/PRD_AI_CRM.md`**.
 
 ## License
 
