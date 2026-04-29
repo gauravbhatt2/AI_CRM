@@ -43,7 +43,7 @@ Create **`ai-crm-system/.env`** (never commit secrets):
 | `OPENROUTER_MODEL` | e.g. `google/gemma-3-12b-it:free` |
 | `GROQ_LABEL_SPEAKERS` | Extra Groq call for labels if pyannote did not run (default `true`) |
 | `HUBSPOT_API_KEY` | Optional; HubSpot deal/contact/company sync |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Optional; Google OAuth for Gmail + Calendar routes |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | Optional; Google OAuth for Gmail + Calendar routes. Example: `http://127.0.0.1:8001/api/v1/google/auth/callback` |
 
 ```bash
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
@@ -81,6 +81,7 @@ npm run build    # output in dist/ (listed in .gitignore — do not commit)
 | Whisper / FFmpeg | Install FFmpeg; restart shell |
 | pyannote errors | `pip install` includes torch/pyannote; HF token; model license; or set `PYANNOTE_ENABLED=false` |
 | Chat always “Not available” | Set `OPENROUTER_API_KEY` or rely on Groq fallback |
+| Google sign-in shows `redirect_uri_mismatch` | Register the exact backend callback in Google Cloud and make it match backend `.env` exactly, including host and port, e.g. `http://127.0.0.1:8001/api/v1/google/auth/callback` |
 | Google features disabled | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` in backend `.env` |
 
 ## Repo hygiene

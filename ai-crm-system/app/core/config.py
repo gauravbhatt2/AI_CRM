@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Project root = directory that contains the `app` package (not process cwd).
@@ -115,6 +115,18 @@ class Settings(BaseSettings):
         default="http://localhost:5173/",
         description="Browser URL after OAuth callback (must match a registered redirect URI)",
     )
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def normalize_debug(cls, value):
+        """Accept common deployment strings from shared shell environments."""
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production"}:
+                return False
+            if normalized in {"debug", "dev", "development"}:
+                return True
+        return value
 
 
 @lru_cache

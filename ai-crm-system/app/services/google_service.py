@@ -9,6 +9,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from starlette.datastructures import URL
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -35,12 +36,25 @@ def _get_client_config() -> dict:
     }
 
 
-def get_oauth_flow() -> Flow:
+def get_google_redirect_uri(request_base_url: str | None = None) -> str | None:
+    """Return the configured callback URL, or derive it from the current request."""
+    configured = (settings.google_redirect_uri or "").strip()
+    if configured:
+        return configured
+
+    if not request_base_url:
+        return None
+
+    return str(URL(request_base_url).replace(path="/api/v1/google/auth/callback", query=""))
+
+
+def get_oauth_flow(request_base_url: str | None = None) -> Flow:
     """Returns an OAuth Flow instance pre-configured from env logic."""
+    redirect_uri = get_google_redirect_uri(request_base_url)
     flow = Flow.from_client_config(
         _get_client_config(),
         scopes=SCOPES,
-        redirect_uri=settings.google_redirect_uri,
+        redirect_uri=redirect_uri,
     )
     return flow
 

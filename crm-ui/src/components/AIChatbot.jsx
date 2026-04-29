@@ -8,7 +8,91 @@ const SUGGESTIONS = [
   "What budget or timeline signals appear in the record?",
 ];
 
-/** Full-page deal assistant — rendered inside `/chat` (page title lives in ChatPage). */
+function formatRecordTimestamp(iso) {
+  if (!iso) return "No timestamp";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "No timestamp";
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function getRecordLabel(record) {
+  const title = (record.mentioned_company || "").trim() || record.product || "Record";
+  return `#${record.id} - ${title} - ${formatRecordTimestamp(record.created_at)}`;
+}
+
+function renderMessageText(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const blocks = [];
+  let paragraph = [];
+  let list = [];
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push({ type: "paragraph", text: paragraph.join("\n") });
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!list.length) return;
+    blocks.push({ type: "list", items: list });
+    list = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const bulletMatch = trimmed.match(/^([-*•]|\d+[.)])\s+(.*)$/);
+
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    if (bulletMatch) {
+      flushParagraph();
+      list.push(bulletMatch[2]);
+      continue;
+    }
+
+    flushList();
+    paragraph.push(trimmed);
+  }
+
+  flushParagraph();
+  flushList();
+
+  if (!blocks.length) {
+    return <p className="whitespace-pre-wrap">{text}</p>;
+  }
+
+  return (
+    <div className="space-y-3">
+      {blocks.map((block, index) =>
+        block.type === "list" ? (
+          <ul key={index} className="list-disc space-y-1 pl-5">
+            {block.items.map((item, itemIndex) => (
+              <li key={itemIndex} className="whitespace-pre-wrap">
+                {item}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p key={index} className="whitespace-pre-wrap">
+            {block.text}
+          </p>
+        ),
+      )}
+    </div>
+  );
+}
+
+/** Full-page deal assistant rendered inside `/chat` (page title lives in ChatPage). */
 export default function AIChatbot() {
   const [records, setRecords] = useState([]);
   const [recordId, setRecordId] = useState("");
@@ -60,7 +144,10 @@ export default function AIChatbot() {
   return (
     <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-outline-variant/20 bg-surface-container-lowest shadow-[0_8px_40px_-12px_rgba(32,27,20,0.12)]">
       <div className="shrink-0 border-b border-outline-variant/15 bg-surface-container-low/60 px-5 py-4">
-        <label htmlFor="chat-record-select" className="mb-2 block text-[10px] font-bold uppercase tracking-widest text-on-surface-variant">
+        <label
+          htmlFor="chat-record-select"
+          className="mb-2 block text-[10px] font-bold uppercase tracking-widest text-on-surface-variant"
+        >
           Conversation context
         </label>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -73,25 +160,25 @@ export default function AIChatbot() {
             }}
             className="w-full flex-1 rounded-xl border border-outline-variant/35 bg-background px-4 py-3 text-sm font-medium text-primary shadow-inner sm:max-w-xl"
           >
-            <option value="">Select a CRM record to begin…</option>
+            <option value="">Select a CRM record to begin...</option>
             {records.map((r) => (
               <option key={r.id} value={r.id}>
-                #{r.id} · {(r.mentioned_company || "").trim() || r.product || "Record"}
+                {getRecordLabel(r)}
               </option>
             ))}
           </select>
           {selectedLabel ? (
             <span className="text-xs text-on-surface-variant sm:pl-2">
-              Asking about <span className="font-semibold text-primary">#{selectedLabel.id}</span>
+              Asking about <span className="font-semibold text-primary">{getRecordLabel(selectedLabel)}</span>
             </span>
           ) : null}
         </div>
         <p className="mt-2 text-xs text-on-surface-variant/90">
-          The assistant reads the saved CRM record (summary, transcript excerpt, scores). Pick a record before sending a message.
+          The assistant reads the saved CRM record (summary, transcript excerpt, scores). Pick a record before sending a
+          message.
         </p>
       </div>
 
-      {/* Large light canvas: fills space; inner thread scrolls only when content overflows */}
       <div className="relative flex min-h-0 flex-1 flex-col bg-background px-5 py-6 md:px-8 md:py-8">
         {empty ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-6 text-center">
@@ -102,8 +189,8 @@ export default function AIChatbot() {
               <div>
                 <p className="font-headline text-sm font-bold text-primary">Select a record</p>
                 <p className="mt-2 max-w-md text-sm text-on-surface-variant">
-                  Use the dropdown above to attach this chat to a specific deal or interaction. Then you can ask about risks,
-                  next steps, or summaries.
+                  Use the dropdown above to attach this chat to a specific deal or interaction. Then you can ask about
+                  risks, next steps, or summaries.
                 </p>
               </div>
             ) : (
@@ -141,14 +228,14 @@ export default function AIChatbot() {
                           : "rounded-tl-md bg-primary-container text-white"
                       }`}
                     >
-                      {m.text}
+                      {renderMessageText(m.text)}
                     </div>
                   </div>
                 ))}
                 {sending && (
                   <div className="flex items-center gap-2 pl-1 text-[10px] font-bold uppercase tracking-wider text-secondary/70">
                     <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-secondary" />
-                    Thinking…
+                    Thinking...
                   </div>
                 )}
               </div>
@@ -173,7 +260,7 @@ export default function AIChatbot() {
                   send();
                 }
               }}
-              placeholder={recordId ? "Ask about this deal…" : "Select a record above to enable chat"}
+              placeholder={recordId ? "Ask about this deal..." : "Select a record above to enable chat"}
               disabled={!recordId || sending}
               className="min-h-[44px] flex-1 border-none bg-transparent px-3 text-sm text-primary placeholder:text-on-surface-variant/50 focus:ring-0 disabled:opacity-50"
             />
@@ -188,7 +275,7 @@ export default function AIChatbot() {
             </button>
           </div>
           <p className="mt-2 text-center text-[10px] text-on-surface-variant/80">
-            Powered by the Agents API · messages are not stored after refresh
+            Powered by the Agents API - messages are not stored after refresh
           </p>
         </div>
       </div>

@@ -5,7 +5,7 @@ import json as _json
 import urllib.error
 import urllib.request
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -49,13 +49,16 @@ class CalendarEventSchema(BaseModel):
     deal_id: int | None = None
 
 
-@router.get("/auth/")
-def auth_google():
+@router.get("/auth")
+def auth_google(request: Request):
     """Start Google OAuth flow."""
-    flow = google_service.get_oauth_flow()
+    flow = google_service.get_oauth_flow(str(request.base_url))
     auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
     oauth_states[state] = flow
-    return {"url": auth_url}
+    return {
+        "url": auth_url,
+        "redirect_uri": google_service.get_google_redirect_uri(str(request.base_url)),
+    }
 
 
 @router.get("/auth/callback")
@@ -84,7 +87,7 @@ def signout_google(db: Session = Depends(get_db)):
     return {"status": "signed_out"}
 
 
-@router.get("/status/")
+@router.get("/status")
 def check_google_status(db: Session = Depends(get_db)):
     """Check if saved Google credentials work with a live tokeninfo call."""
     try:
